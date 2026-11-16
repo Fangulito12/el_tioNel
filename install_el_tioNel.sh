@@ -2758,8 +2758,8 @@ bh_active(){ local p; for p in $(bh_ports); do systemctl is-active --quiet "${BR
 xr_installed(){ [ -x "$XR_BIN" ] && [ -f "$XR_STATE" ]; }
 xr_port(){ grep -m1 '^PORT=' "$XR_STATE" 2>/dev/null | cut -d= -f2; }
 xr_active(){ systemctl is-active --quiet "${BRAND}-xray.service" 2>/dev/null; }
-hy_active(){ pgrep -f '[h]ysteria' >/dev/null 2>&1 || systemctl list-units --type=service --state=active 2>/dev/null | grep -qi hysteria; }
-hy_port(){ ss -ulnp 2>/dev/null | grep -i hysteria | awk '{print $5}' | sed 's/.*://' | head -1; }
+hy_active(){ pgrep -af '[h]ysteria' 2>/dev/null | grep -v "${BRAND}-hysteria" | grep -q . || systemctl list-units --type=service --state=active 2>/dev/null | grep -i hysteria | grep -qv "${BRAND}-hysteria"; }
+hy_port(){ ss -ulnp 2>/dev/null | grep -i hysteria | grep -v "${BRAND}-hysteria" | awk '{print $5}' | sed 's/.*://' | head -1; }
 bbr_on(){ [ "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)" = "bbr" ]; }
 ufw_on(){ have ufw && ufw status 2>/dev/null | grep -q '^Status: active'; }
 conn_count(){ ss -tan 2>/dev/null | awk -v p=":$1" '$1=="ESTAB" && $4 ~ p"$" {n++} END{print n+0}'; }
@@ -2878,6 +2878,278 @@ ug_menu(){
       6) ask p " Puerto [$(ug_ports | awk '{print $1}')]: "; p="${p:-$(ug_ports | awk '{print $1}')}"
          journalctl -u "$(ug_unit "$p")" -n 50 --no-pager 2>/dev/null || info "Sin logs."; pause;;
       7) ug_uninstall; pause;;
+      0) return 0;;
+      *) echo " Opcion invalida"; sleep 1;;
+    esac
+  done
+}
+
+# =====================================================================
+#  HYSTERIA v1  (transporte UDP/QUIC hacia el SSH del VPS)
+#  Reemplaza a BHTTP como transporte: la app abre un tunel Hysteria que
+#  llega SOLO al sshd local (127.0.0.1). El control por HWID sigue siendo
+#  el login SSH. Un usuario de sistema dedicado + reglas iptables impiden
+#  que el servicio Hysteria sirva de proxy abierto hacia internet.
+# =====================================================================
+HV_VER="v1.3.5"
+HV_USER="tionelhy"
+HV_DIR="$ROOT/etc/${BRAND}-hysteria"
+HV_STATE="$HV_DIR/state"
+HV_CONF="$HV_DIR/config.json"
+HV_APPDIR="$ROOT/opt/${BRAND}-hysteria"
+HV_BIN="$HV_APPDIR/${BRAND}-hysteria"
+HV_FW="$SBIN/${BRAND}-hysteria-fw"
+HV_UNIT_NAME="${BRAND}-hysteria.service"
+HV_UNIT="$ROOT/etc/systemd/system/$HV_UNIT_NAME"
+
+hv_installed(){ [ -x "$HV_BIN" ] && [ -f "$HV_STATE" ]; }
+hv_get(){ grep -m1 "^$1=" "$HV_STATE" 2>/dev/null | cut -d= -f2-; }
+hv_set(){
+  mkdir -p "$HV_DIR"; [ -f "$HV_STATE" ] || : > "$HV_STATE"
+  grep -v "^$1=" "$HV_STATE" > "$HV_STATE.tmp" || true
+  printf '%s=%s\n' "$1" "$2" >> "$HV_STATE.tmp"; mv "$HV_STATE.tmp" "$HV_STATE"; chmod 600 "$HV_STATE"
+}
+hv_active(){ systemctl is-active --quiet "$HV_UNIT_NAME" 2>/dev/null; }
+hv_rand(){ head -c 48 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c "${1:-16}"; }
+hv_ssh_ports(){
+  local p=""
+  have sshd && p="$(sshd -T 2>/dev/null | awk '/^port /{print $2}' | sort -n -u | tr '\n' ' ')"
+  p="${p% }"; echo "${p:-22}"
+}
+hv_arch(){
+  case "$(uname -m)" in
+    x86_64|amd64) echo amd64;; aarch64|arm64) echo arm64;; armv7l|armv7) echo arm;; *) echo "";;
+  esac
+}
+hv_get_binary(){
+  local arch f base tmp hv_hash got
+  arch="$(hv_arch)"; [ -n "$arch" ] || { fail "Arquitectura no soportada: $(uname -m)"; return 1; }
+  have curl || { have apt-get && DEBIAN_FRONTEND=noninteractive apt-get install -y curl >/dev/null 2>&1; }
+  have curl || { fail "Falta curl."; return 1; }
+  f="hysteria-linux-$arch"
+  base="https://github.com/apernet/hysteria/releases/download/$HV_VER"
+  tmp="$(mktemp -d)"
+  info "Descargando Hysteria $HV_VER ($arch) desde GitHub oficial..."
+  if ! curl -fsSL --retry 3 --connect-timeout 15 -o "$tmp/$f" "$base/$f" \
+     || ! curl -fsSL --retry 3 --connect-timeout 15 -o "$tmp/hashes.txt" "$base/hashes.txt"; then
+    rm -rf "$tmp"; fail "No pude descargar el binario o su lista de hashes (se usa solo GitHub oficial, sin espejos)."; return 1
+  fi
+  hv_hash="$(awk -v n="$f" '{x=$2; sub(/^\*/,"",x); sub(/^.*\//,"",x); if (x==n) {print $1; exit}}' "$tmp/hashes.txt")"
+  got="$(sha256sum "$tmp/$f" | cut -d' ' -f1)"
+  if [ -z "$hv_hash" ] || [ "$hv_hash" != "$got" ]; then
+    rm -rf "$tmp"; fail "El hash SHA256 del binario no coincide (o no esta en hashes.txt). No se instala."; return 1
+  fi
+  mkdir -p "$HV_APPDIR"
+  install -m 755 "$tmp/$f" "$HV_BIN" && rm -rf "$tmp" && ok "Binario verificado (SHA256) e instalado."
+}
+hv_ensure_user(){
+  id "$HV_USER" >/dev/null 2>&1 && return 0
+  useradd -r -M -s /usr/sbin/nologin "$HV_USER" 2>/dev/null || useradd -r -M -s /sbin/nologin "$HV_USER" 2>/dev/null \
+    || { fail "No pude crear el usuario $HV_USER."; return 1; }
+}
+hv_ensure_tools(){
+  have openssl && have iptables && return 0
+  have apt-get || { fail "Faltan openssl/iptables y no hay apt-get."; return 1; }
+  DEBIAN_FRONTEND=noninteractive apt-get update -qq >/dev/null 2>&1 || true
+  DEBIAN_FRONTEND=noninteractive apt-get install -y openssl iptables >/dev/null 2>&1 || true
+  have openssl && have iptables || { fail "No pude instalar openssl/iptables."; return 1; }
+}
+hv_make_cert(){
+  local ip; ip="$(public_ip)"; ip="${ip:-127.0.0.1}"
+  mkdir -p "$HV_DIR"
+  [ -f "$HV_DIR/server.crt" ] && [ -f "$HV_DIR/server.key" ] && return 0
+  openssl req -x509 -nodes -newkey rsa:2048 -days 3650 -keyout "$HV_DIR/server.key" -out "$HV_DIR/server.crt" \
+    -subj "/CN=$ip" -addext "subjectAltName=IP:$ip" >/dev/null 2>&1 \
+    || openssl req -x509 -nodes -newkey rsa:2048 -days 3650 -keyout "$HV_DIR/server.key" -out "$HV_DIR/server.crt" -subj "/CN=$ip" >/dev/null 2>&1 \
+    || { fail "No pude generar el certificado."; return 1; }
+  chown "$HV_USER" "$HV_DIR/server.key" "$HV_DIR/server.crt" 2>/dev/null || true
+  chmod 600 "$HV_DIR/server.key"
+}
+hv_write_config(){
+  local port obfs auth up down
+  port="$(hv_get PORT)"; obfs="$(hv_get OBFS)"; auth="$(hv_get AUTH)"; up="$(hv_get UP)"; down="$(hv_get DOWN)"
+  mkdir -p "$HV_DIR"
+  cat > "$HV_CONF" <<EOF
+{
+  "listen": ":$port",
+  "protocol": "udp",
+  "cert": "$HV_DIR/server.crt",
+  "key": "$HV_DIR/server.key",
+  "obfs": "$obfs",
+  "auth": { "mode": "passwords", "config": ["$auth"] },
+  "up_mbps": ${up:-100},
+  "down_mbps": ${down:-100},
+  "recv_window_conn": 15728640,
+  "recv_window_client": 67108864,
+  "max_conn_client": 4096,
+  "disable_udp": true
+}
+EOF
+  chown "$HV_USER" "$HV_CONF" 2>/dev/null || true; chmod 600 "$HV_CONF"
+}
+# Restringe lo que el usuario del servicio puede abrir hacia afuera: solo el SSH local.
+hv_write_fw(){
+  local sp; sp="$(hv_get SSHPORTS)"; sp="${sp:-22}"
+  mkdir -p "$(dirname "$HV_FW")"
+  cat > "$HV_FW" <<EOF
+#!/bin/sh
+# $BRAND Hysteria: el servicio solo puede conectar a 127.0.0.1 (SSH). Cualquier otro destino se rechaza.
+UID_HV="\$(id -u $HV_USER)" || exit 1
+PORTS="$(echo "$sp" | tr ' ' ',')"
+CH=TIONEL_HV
+apply(){
+  IPT="\$1"; LO="\$2"
+  command -v "\$IPT" >/dev/null 2>&1 || return 0
+  "\$IPT" -N \$CH 2>/dev/null || true
+  "\$IPT" -F \$CH || return 1
+  "\$IPT" -A \$CH -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT || return 1
+  "\$IPT" -A \$CH -o lo -p tcp -d "\$LO" -m multiport --dports "\$PORTS" -j ACCEPT || return 1
+  "\$IPT" -A \$CH -j REJECT || return 1
+  "\$IPT" -C OUTPUT -m owner --uid-owner "\$UID_HV" -j \$CH 2>/dev/null || "\$IPT" -I OUTPUT 1 -m owner --uid-owner "\$UID_HV" -j \$CH || return 1
+}
+remove(){
+  IPT="\$1"
+  command -v "\$IPT" >/dev/null 2>&1 || return 0
+  while "\$IPT" -D OUTPUT -m owner --uid-owner "\$UID_HV" -j \$CH 2>/dev/null; do :; done
+  "\$IPT" -F \$CH 2>/dev/null; "\$IPT" -X \$CH 2>/dev/null; return 0
+}
+case "\$1" in
+  add) apply iptables 127.0.0.1/8 && { command -v ip6tables >/dev/null 2>&1 && apply ip6tables ::1/128 || true; } ;;
+  del) remove iptables; remove ip6tables; exit 0 ;;
+  *) exit 2 ;;
+esac
+EOF
+  chmod 755 "$HV_FW"
+}
+hv_write_unit(){
+  mkdir -p "$(dirname "$HV_UNIT")"
+  cat > "$HV_UNIT" <<EOF
+[Unit]
+Description=$BRAND Hysteria v1 (transporte hacia SSH)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=$HV_USER
+ExecStartPre=+$HV_FW add
+ExecStart=$HV_BIN server -c $HV_CONF
+ExecStopPost=+$HV_FW del
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+Restart=always
+RestartSec=3
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload >/dev/null 2>&1 || true
+}
+hv_open_port(){
+  if ufw_on; then ufw allow "$1/udp" >/dev/null 2>&1 && ok "UFW: abierto $1/udp"; fi
+  info "Recuerda abrir el puerto UDP $1 tambien en el panel de tu proveedor de VPS."
+}
+hv_close_port(){ ufw_on && ufw delete allow "$1/udp" >/dev/null 2>&1 || true; }
+hv_apply(){      # regenera todo y reinicia
+  hv_write_config; hv_write_fw; hv_write_unit
+  systemctl enable "$HV_UNIT_NAME" >/dev/null 2>&1 || true
+  systemctl restart "$HV_UNIT_NAME" >/dev/null 2>&1
+  sleep 2
+  if hv_active; then ok "Hysteria v1 activo en UDP :$(hv_get PORT)"
+  else fail "No arranco (mira: journalctl -u $HV_UNIT_NAME)"; return 1; fi
+}
+hv_install(){
+  need_root
+  local port obfs auth up down
+  have apt-get || warn "Sin apt-get: se intentara seguir, pero no esta probado."
+  hv_ensure_tools || return 1
+  hv_ensure_user || return 1
+  hv_get_binary || return 1
+  ask port " Puerto UDP [36712]: "; port="${port:-36712}"
+  valid_port "$port" || { fail "Puerto invalido."; return 1; }
+  if ss -lnu 2>/dev/null | awk -v p=":$port" '$4 ~ p"$" {f=1} END{exit !f}' && [ "$(hv_get PORT)" != "$port" ]; then
+    fail "El puerto UDP $port ya esta en uso."; return 1
+  fi
+  ask obfs " OBFS (Enter = generar uno aleatorio): "; obfs="${obfs:-$(hv_rand 16)}"
+  ask auth " Contraseña Hysteria (Enter = aleatoria): "; auth="${auth:-$(hv_rand 20)}"
+  valid_secret "$obfs" && valid_secret "$auth" || { fail "OBFS/contraseña: solo letras, numeros . _ @ - (4 a 128)."; return 1; }
+  [ "$obfs" = "crisdev" ] || [ "$auth" = "crisdev" ] && { fail "No uses 'crisdev': es publico."; return 1; }
+  ask up " Subida Mbps de tu VPS [100]: "; up="${up:-100}"; ask down " Bajada Mbps de tu VPS [100]: "; down="${down:-100}"
+  [[ "$up" =~ ^[0-9]+$ ]] || up=100
+  [[ "$down" =~ ^[0-9]+$ ]] || down=100
+  hv_set PORT "$port"; hv_set OBFS "$obfs"; hv_set AUTH "$auth"; hv_set UP "$up"; hv_set DOWN "$down"
+  hv_set SSHPORTS "$(hv_ssh_ports)"
+  hv_make_cert || return 1
+  hv_open_port "$port"
+  hv_apply || return 1
+  echo; hv_show
+}
+hv_show(){
+  hv_installed || { warn "Hysteria v1 no esta instalado."; return 0; }
+  echo " ---- Datos para la app ----"
+  printf ' %-16s %s\n' "Servidor:" "$(public_ip)"
+  printf ' %-16s %s\n' "Puerto UDP:" "$(hv_get PORT)"
+  printf ' %-16s %s\n' "OBFS:" "$(hv_get OBFS)"
+  printf ' %-16s %s\n' "Contraseña:" "$(hv_get AUTH)"
+  printf ' %-16s %s\n' "Up/Down Mbps:" "$(hv_get UP)/$(hv_get DOWN)"
+  printf ' %-16s %s\n' "Destino SSH:" "127.0.0.1:$(hv_get SSHPORTS | awk '{print $1}')"
+  echo
+  info "El login sigue siendo por SSH (usuarios HWID del panel). Hysteria solo lleva el tunel hasta el SSH local."
+}
+hv_change_port(){
+  hv_installed || { warn "Instala primero."; return 0; }
+  local np old; old="$(hv_get PORT)"; ask np " Nuevo puerto UDP [$old]: "; np="${np:-$old}"
+  valid_port "$np" || { fail "Puerto invalido."; return 1; }
+  [ "$np" = "$old" ] && { info "Sin cambios."; return 0; }
+  if ss -lnu 2>/dev/null | awk -v p=":$np" '$4 ~ p"$" {f=1} END{exit !f}'; then fail "El puerto UDP $np ya esta en uso."; return 1; fi
+  hv_set PORT "$np"; hv_close_port "$old"; hv_open_port "$np"; hv_apply
+}
+hv_change_creds(){
+  hv_installed || { warn "Instala primero."; return 0; }
+  local o a; ask o " Nuevo OBFS (Enter = aleatorio): "; o="${o:-$(hv_rand 16)}"
+  ask a " Nueva contraseña (Enter = aleatoria): "; a="${a:-$(hv_rand 20)}"
+  valid_secret "$o" && valid_secret "$a" || { fail "Solo letras, numeros . _ @ - (4 a 128)."; return 1; }
+  hv_set OBFS "$o"; hv_set AUTH "$a"; hv_apply && { echo; hv_show; warn "Actualiza estos datos en la app de tus clientes."; }
+}
+hv_uninstall(){
+  need_root; hv_installed || { info "No esta instalado."; return 0; }
+  confirm_word BORRAR "Se quitara Hysteria v1 de este panel." || { info "Sin cambios."; return 0; }
+  hv_close_port "$(hv_get PORT)"
+  systemctl disable --now "$HV_UNIT_NAME" >/dev/null 2>&1 || true
+  [ -x "$HV_FW" ] && "$HV_FW" del >/dev/null 2>&1 || true
+  rm -f "$HV_UNIT" "$HV_FW"; rm -rf "$HV_DIR" "$HV_APPDIR"
+  id "$HV_USER" >/dev/null 2>&1 && userdel "$HV_USER" >/dev/null 2>&1 || true
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  ok "Hysteria v1 desinstalado."
+}
+hv_menu(){
+  need_root; local op
+  while true; do
+    clear 2>/dev/null || true; calc_w
+    title "ADMINISTRADOR HYSTERIA v1 (SSH)"
+    if hv_installed; then
+      printf ' %bUDP :%b %s   ' "$GY" "$WH" "$(hv_get PORT)"; hv_active && tag on || tag off; echo
+    else printf ' %bHysteria v1 sin instalar%b\n' "$GY" "$C_O"; fi
+    dash
+    item 1 "INSTALAR / REINSTALAR"
+    item 2 "VER DATOS PARA LA APP"
+    item 3 "CAMBIAR PUERTO"
+    item 4 "CAMBIAR OBFS / CONTRASEÑA"
+    item 5 "REINICIAR"
+    item 6 "DETENER"
+    item 7 "VER LOGS"
+    item 8 "[!] DESINSTALAR" "$OR"
+    hl; printf ' %b[0]%b %b Volver %b\n' "$GY" "$C_O" "$BGR" "$C_O"; hl
+    ask_op op
+    case "$op" in
+      1) hv_install; pause;;
+      2) hv_show; pause;;
+      3) hv_change_port; pause;;
+      4) hv_change_creds; pause;;
+      5) if hv_installed; then hv_apply; else warn "No esta instalado."; fi; pause;;
+      6) systemctl stop "$HV_UNIT_NAME" 2>/dev/null; warn "Detenido (vuelve a arrancar con Reiniciar)."; pause;;
+      7) journalctl -u "$HV_UNIT_NAME" -n 50 --no-pager 2>/dev/null || info "Sin logs."; pause;;
+      8) hv_uninstall; pause;;
       0) return 0;;
       *) echo " Opcion invalida"; sleep 1;;
     esac
@@ -3133,25 +3405,28 @@ restart_services(){
   if bh_installed; then "$BH_MGR" restart; did=1; fi
   if xr_installed; then systemctl restart "${BRAND}-xray.service" && ok "V2Ray reiniciado."; did=1; fi
   if ug_installed; then for p in $(ug_ports); do systemctl restart "$(ug_unit "$p")"; done; ok "BADVPN-UDPGW reiniciado."; did=1; fi
+  if hv_installed; then hv_apply; did=1; fi
   [ "$did" -eq 1 ] || info "No hay servicios instalados."
 }
 reboot_server(){ confirm_word REINICIAR "Se reiniciara TODO el servidor y se cortaran las conexiones." || { info "Sin cambios."; return 0; }; info "Reiniciando..."; sleep 1; reboot; }
 logs_menu(){
-  local o p; echo "1) BHTTP   2) V2Ray   3) BADVPN-UDPGW"; ask o "Cual: "
+  local o p; echo "1) BHTTP   2) V2Ray   3) BADVPN-UDPGW   4) HYSTERIA v1"; ask o "Cual: "
   case "$o" in
     1) write_subs; "$BH_MGR" logs;;
     2) journalctl -u "${BRAND}-xray.service" -n 80 --no-pager 2>/dev/null || info "Sin logs.";;
+    4) journalctl -u "$HV_UNIT_NAME" -n 80 --no-pager 2>/dev/null || info "Sin logs.";;
     3) p="$(ug_ports | awk '{print $1}')"; [ -n "$p" ] && { journalctl -u "$(ug_unit "$p")" -n 80 --no-pager 2>/dev/null || info "Sin logs."; } || info "BADVPN-UDPGW sin instalar.";;
   esac
 }
 uninstall_all(){
   need_root; write_subs
-  warn "Esto desinstala BHTTP, V2Ray, BADVPN-UDPGW y este panel. No toca tu SSH, Hysteria2 ni las cuentas de usuario ya creadas."
+  warn "Esto desinstala BHTTP, V2Ray, BADVPN-UDPGW, Hysteria v1 y este panel. No toca tu SSH, Hysteria2 ni las cuentas de usuario ya creadas."
   confirm_word TODO "Desinstalar todo." || { info "Sin cambios."; return 0; }
   bh_installed && BHTTP_YES=1 "$BH_MGR" uninstall
   [ -f "$BH_TUNE" ] && BHTTP_YES=1 "$BH_MGR" tuning-off
   xr_installed && XRAY_YES=1 "$XR_MGR" uninstall
   if ug_installed; then TIONEL_YES=1 ug_uninstall; fi
+  if hv_installed; then TIONEL_YES=1 hv_uninstall; fi
   rm -f "$CRON_FILE" "$BH_MGR" "$BH_LINK" "$XR_MGR" "$XR_LINK" "$PANEL_LINK" "$PANEL_DEST"
   ok "$BRAND desinstalado por completo."; exit 0
 }
@@ -3173,11 +3448,13 @@ protocols_menu(){
     else pitem 2 "V2RAY/XRAY REALITY" none "(sin instalar)"; fi
     if ug_installed; then ug_active && st=on || st=off; pitem 3 "BADVPN-UDPGW" "$st" "$(ug_ports)"
     else pitem 3 "BADVPN-UDPGW" none "(sin instalar)"; fi
-    if hy_active; then pitem 4 "HYSTERIA2" on "udp :$(hy_port)"; else pitem 4 "HYSTERIA2" none "(no detectado)"; fi
+    if hv_installed; then hv_active && st=on || st=off; pitem 4 "HYSTERIA v1 (SSH)" "$st" "udp :$(hv_get PORT)"
+    else pitem 4 "HYSTERIA v1 (SSH)" none "(sin instalar)"; fi
+    if hy_active; then pitem 5 "HYSTERIA2" on "udp :$(hy_port)"; else pitem 5 "HYSTERIA2" none "(no detectado)"; fi
     hl; printf ' %b[0]%b %b Volver %b\n' "$GY" "$C_O" "$BGR" "$C_O"; hl
     ask_op op
     case "$op" in
-      1) open_bhttp;; 2) open_xray;; 3) ug_menu;; 4) hysteria_info; pause;;
+      1) open_bhttp;; 2) open_xray;; 3) ug_menu;; 4) hv_menu;; 5) hysteria_info; pause;;
       0) return 0;; *) echo " Opcion invalida"; sleep 1;;
     esac
   done
@@ -3254,6 +3531,7 @@ $BRAND - panel de VPS v$PANEL_VERSION
   $BRAND status         muestra el estado y sale
   $BRAND users          menu de usuarios HWID/SSH
   $BRAND udpgw          menu de BADVPN-UDPGW
+  $BRAND hysteria       menu de Hysteria v1 (transporte hacia SSH)
   $BRAND expire         borra los usuarios vencidos (lo usa el cron diario)
   $BRAND cleanup        limpia RAM/cache y logs viejos (lo usa el cron del limpiador)
   $BRAND bhttp ...      atajo a $BRAND-bhttp (ej: $BRAND bhttp add-port 8081)
@@ -3270,6 +3548,7 @@ main(){
     status) PANEL_IP="$(public_ip)"; draw;;
     users) need_root; PANEL_IP="$(public_ip)"; users_menu;;
     udpgw) need_root; ug_menu;;
+    hysteria) need_root; PANEL_IP="$(public_ip)"; hv_menu;;
     expire) need_root; u_expired;;
     cleanup) need_root; do_cleanup;;
     bhttp) need_root; write_subs; "$BH_MGR" "$@";;
