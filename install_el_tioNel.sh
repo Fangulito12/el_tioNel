@@ -2901,6 +2901,9 @@ HV_BIN="$HV_APPDIR/${BRAND}-hysteria"
 HV_FW="$SBIN/${BRAND}-hysteria-fw"
 HV_UNIT_NAME="${BRAND}-hysteria.service"
 HV_UNIT="$ROOT/etc/systemd/system/$HV_UNIT_NAME"
+HV_AUTH="$HV_DIR/auth.sh"       # script de autenticacion por HWID (lo llama Hysteria)
+HV_HWIDS="$HV_DIR/hwids"       # lista HWID|vencimiento (la regenera el panel)
+HV_RG=""
 
 hv_installed(){ [ -x "$HV_BIN" ] && [ -f "$HV_STATE" ]; }
 hv_get(){ grep -m1 "^$1=" "$HV_STATE" 2>/dev/null | cut -d= -f2-; }
@@ -2910,6 +2913,63 @@ hv_set(){
   printf '%s=%s\n' "$1" "$2" >> "$HV_STATE.tmp"; mv "$HV_STATE.tmp" "$HV_STATE"; chmod 600 "$HV_STATE"
 }
 hv_active(){ systemctl is-active --quiet "$HV_UNIT_NAME" 2>/dev/null; }
+# Modo de autenticacion: hwid | password (instalaciones viejas sin el dato = password)
+hv_authmode(){ local m; m="$(hv_get AUTHMODE)"; [ "$m" = hwid ] && echo hwid || echo password; }
+hv_valid_range(){
+  [[ "${1:-}" =~ ^([0-9]{1,5})-([0-9]{1,5})$ ]] || return 1
+  local a=$((10#${BASH_REMATCH[1]})) b=$((10#${BASH_REMATCH[2]}))
+  [ "$a" -ge 1 ] && [ "$b" -le 65535 ] && [ "$a" -le "$b" ]
+}
+# Puertos UDP (no locales) que ya escuchan dentro del rango, salvo el de Hysteria
+hv_range_conflicts(){
+  ss -lnu 2>/dev/null | awk -v lo="$1" -v hi="$2" -v own="$3" 'NR>1 {
+    a=$4; if (a ~ /^127\./ || a ~ /^\[::1\]/) next
+    n=split(a,x,":"); p=x[n]+0; if (p>=lo && p<=hi && p!=own) print p }' | sort -nu | tr '\n' ' ' | sed 's/ $//'
+}
+# Valida el rango y lo deja normalizado en HV_RG
+hv_check_range(){      # hv_check_range lo-hi puerto_hysteria
+  local r="$1" own="$2" lo hi c
+  hv_valid_range "$r" || { fail "Rango invalido. Usa el formato 20000-50000 (de 1 a 65535, menor-mayor)."; return 1; }
+  lo=$((10#${r%-*})); hi=$((10#${r#*-}))
+  c="$(hv_range_conflicts "$lo" "$hi" "$own")"
+  if [ -n "$c" ]; then fail "Ya hay servicios UDP escuchando dentro de ese rango (puerto(s): $c). Elige otro rango."; return 1; fi
+  if [ "$lo" -lt 1024 ]; then warn "Incluye puertos bajos: algunos operadores los filtran. Si no conecta, prueba 20000-50000."; fi
+  HV_RG="$lo-$hi"
+}
+# Script que Hysteria llama por cada conexion nueva: auth.sh <addr> <auth> <send> <recv>
+# Exit 0 = permitir. Solo deja pasar HWID creados en el panel (modo HWID) y no vencidos.
+hv_write_auth(){
+  [ "$(hv_authmode)" = hwid ] || return 0
+  mkdir -p "$HV_DIR"; chmod 755 "$HV_DIR" 2>/dev/null || true
+  cat > "$HV_AUTH" <<'HV_AUTH_EOF'
+#!/bin/sh
+# el_tioNel - autenticacion Hysteria v1 por HWID
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+LIST="@LIST@"
+h="$2"
+[ -n "$h" ] || exit 1
+[ "${#h}" -le 64 ] || exit 1
+case "$h" in *'|'*|*'\'*) exit 1;; esac
+[ "$(printf '%s' "$h" | wc -l)" -eq 0 ] || exit 1
+[ -r "$LIST" ] || exit 1
+exp="$(H="$h" awk -F'|' '$1==ENVIRON["H"]{print $2; exit}' "$LIST")"
+[ -n "$exp" ] || exit 1
+e="$(printf '%s' "$exp" | tr -d '-')"
+[ "$e" -ge "$(date +%Y%m%d)" ] 2>/dev/null || exit 1
+exit 0
+HV_AUTH_EOF
+  sed -i "s#@LIST@#$HV_HWIDS#" "$HV_AUTH"
+  chown root:root "$HV_AUTH" 2>/dev/null || true; chmod 755 "$HV_AUTH"
+}
+# Regenera la lista HWID|vencimiento a partir de users.db (se llama al crear/renovar/borrar usuarios)
+hv_sync_hwids(){
+  hv_installed || return 0
+  mkdir -p "$HV_DIR"
+  { db_all | awk -F'|' '$4=="hwid" && $1!="" {print $1 "|" $3}'; } > "$HV_HWIDS.tmp" 2>/dev/null || : > "$HV_HWIDS.tmp"
+  mv "$HV_HWIDS.tmp" "$HV_HWIDS"
+  chown "root:$HV_USER" "$HV_HWIDS" 2>/dev/null || true
+  chmod 640 "$HV_HWIDS"
+}
 hv_rand(){ head -c 48 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c "${1:-16}"; }
 hv_ssh_ports(){
   local p=""
@@ -2966,8 +3026,13 @@ hv_make_cert(){
   chmod 600 "$HV_DIR/server.key"
 }
 hv_write_config(){
-  local port obfs auth up down
+  local port obfs auth up down authblock
   port="$(hv_get PORT)"; obfs="$(hv_get OBFS)"; auth="$(hv_get AUTH)"; up="$(hv_get UP)"; down="$(hv_get DOWN)"
+  if [ "$(hv_authmode)" = hwid ]; then
+    authblock='"auth": { "mode": "external", "config": { "cmd": "'"$HV_AUTH"'" } },'
+  else
+    authblock='"auth": { "mode": "passwords", "config": ["'"$auth"'"] },'
+  fi
   mkdir -p "$HV_DIR"
   cat > "$HV_CONF" <<EOF
 {
@@ -2976,7 +3041,7 @@ hv_write_config(){
   "cert": "$HV_DIR/server.crt",
   "key": "$HV_DIR/server.key",
   "obfs": "$obfs",
-  "auth": { "mode": "passwords", "config": ["$auth"] },
+  $authblock
   "up_mbps": ${up:-100},
   "down_mbps": ${down:-100},
   "recv_window_conn": 15728640,
@@ -2989,7 +3054,8 @@ EOF
 }
 # Restringe lo que el usuario del servicio puede abrir hacia afuera: solo el SSH local.
 hv_write_fw(){
-  local sp; sp="$(hv_get SSHPORTS)"; sp="${sp:-22}"
+  local sp rg hport; sp="$(hv_get SSHPORTS)"; sp="${sp:-22}"
+  rg="$(hv_get RANGE)"; rg="${rg/-/:}"; hport="$(hv_get PORT)"
   mkdir -p "$(dirname "$HV_FW")"
   cat > "$HV_FW" <<EOF
 #!/bin/sh
@@ -2997,6 +3063,9 @@ hv_write_fw(){
 UID_HV="\$(id -u $HV_USER)" || exit 1
 PORTS="$(echo "$sp" | tr ' ' ',')"
 CH=TIONEL_HV
+NCH=TIONEL_HVN
+RANGE="$rg"
+HVPORT="$hport"
 apply(){
   IPT="\$1"; LO="\$2"
   command -v "\$IPT" >/dev/null 2>&1 || return 0
@@ -3013,9 +3082,30 @@ remove(){
   while "\$IPT" -D OUTPUT -m owner --uid-owner "\$UID_HV" -j \$CH 2>/dev/null; do :; done
   "\$IPT" -F \$CH 2>/dev/null; "\$IPT" -X \$CH 2>/dev/null; return 0
 }
+# Salto de puertos: todo el UDP entrante del rango se redirige al puerto real de Hysteria.
+napply(){
+  IPT="\$1"
+  [ -n "\$RANGE" ] || return 0
+  command -v "\$IPT" >/dev/null 2>&1 || return 0
+  "\$IPT" -t nat -N \$NCH 2>/dev/null || true
+  "\$IPT" -t nat -F \$NCH || return 1
+  "\$IPT" -t nat -A \$NCH -p udp --dport "\$RANGE" -j REDIRECT --to-ports "\$HVPORT" || return 1
+  "\$IPT" -t nat -C PREROUTING -j \$NCH 2>/dev/null || "\$IPT" -t nat -I PREROUTING 1 -j \$NCH || return 1
+}
+nremove(){
+  IPT="\$1"
+  command -v "\$IPT" >/dev/null 2>&1 || return 0
+  while "\$IPT" -t nat -D PREROUTING -j \$NCH 2>/dev/null; do :; done
+  "\$IPT" -t nat -F \$NCH 2>/dev/null; "\$IPT" -t nat -X \$NCH 2>/dev/null; return 0
+}
 case "\$1" in
-  add) apply iptables 127.0.0.1/8 && { command -v ip6tables >/dev/null 2>&1 && apply ip6tables ::1/128 || true; } ;;
-  del) remove iptables; remove ip6tables; exit 0 ;;
+  add)
+    apply iptables 127.0.0.1/8 || exit 1
+    command -v ip6tables >/dev/null 2>&1 && { apply ip6tables ::1/128 || true; }
+    nremove iptables; napply iptables || echo "aviso: no pude crear la redireccion NAT del rango de puertos (iptables)" >&2
+    nremove ip6tables; napply ip6tables >/dev/null 2>&1 || true
+    exit 0 ;;
+  del) remove iptables; remove ip6tables; nremove iptables; nremove ip6tables; exit 0 ;;
   *) exit 2 ;;
 esac
 EOF
@@ -3051,16 +3141,20 @@ hv_open_port(){
 }
 hv_close_port(){ ufw_on && ufw delete allow "$1/udp" >/dev/null 2>&1 || true; }
 hv_apply(){      # regenera todo y reinicia
-  hv_write_config; hv_write_fw; hv_write_unit
+  hv_write_auth; hv_sync_hwids; hv_write_config; hv_write_fw; hv_write_unit
   systemctl enable "$HV_UNIT_NAME" >/dev/null 2>&1 || true
   systemctl restart "$HV_UNIT_NAME" >/dev/null 2>&1
   sleep 2
   if hv_active; then ok "Hysteria v1 activo en UDP :$(hv_get PORT)"
+    if [ -n "$(hv_get RANGE)" ]; then
+      if iptables -t nat -S TIONEL_HVN >/dev/null 2>&1; then ok "Salto de puertos: UDP $(hv_get RANGE) -> $(hv_get PORT)"
+      else warn "No se pudo crear la redireccion del rango (mira: journalctl -u $HV_UNIT_NAME)"; fi
+    fi
   else fail "No arranco (mira: journalctl -u $HV_UNIT_NAME)"; return 1; fi
 }
 hv_install(){
   need_root
-  local port obfs auth up down
+  local port obfs auth up down authmode am rg
   have apt-get || warn "Sin apt-get: se intentara seguir, pero no esta probado."
   hv_ensure_tools || return 1
   hv_ensure_user || return 1
@@ -3071,13 +3165,23 @@ hv_install(){
     fail "El puerto UDP $port ya esta en uso."; return 1
   fi
   ask obfs " OBFS (Enter = generar uno aleatorio): "; obfs="${obfs:-$(hv_rand 16)}"
-  ask auth " Contraseña Hysteria (Enter = aleatoria): "; auth="${auth:-$(hv_rand 20)}"
-  valid_secret "$obfs" && valid_secret "$auth" || { fail "OBFS/contraseña: solo letras, numeros . _ @ - (4 a 128)."; return 1; }
-  [ "$obfs" = "crisdev" ] || [ "$auth" = "crisdev" ] && { fail "No uses 'crisdev': es publico."; return 1; }
+  ask am " Autenticacion: [1] HWID (la app deja la contraseña vacia)  [2] Contraseña fija  [1]: "
+  if [ "${am:-1}" = 2 ]; then
+    authmode=password
+    ask auth " Contraseña Hysteria (Enter = aleatoria): "; auth="${auth:-$(hv_rand 20)}"
+  else
+    authmode=hwid; auth=""
+  fi
+  valid_secret "$obfs" || { fail "OBFS: solo letras, numeros . _ @ - (4 a 128)."; return 1; }
+  if [ "$authmode" = password ]; then valid_secret "$auth" || { fail "Contraseña: solo letras, numeros . _ @ - (4 a 128)."; return 1; }; fi
+  if [ "$obfs" = "crisdev" ] || [ "$auth" = "crisdev" ]; then fail "No uses 'crisdev': es publico."; return 1; fi
+  ask rg " Rango de puertos UDP para salto, ej. 20000-50000 (Enter = sin rango): "; rg="${rg// /}"
+  if [ -n "$rg" ]; then hv_check_range "$rg" "$port" || return 1; rg="$HV_RG"; fi
   ask up " Subida Mbps de tu VPS [100]: "; up="${up:-100}"; ask down " Bajada Mbps de tu VPS [100]: "; down="${down:-100}"
   [[ "$up" =~ ^[0-9]+$ ]] || up=100
   [[ "$down" =~ ^[0-9]+$ ]] || down=100
   hv_set PORT "$port"; hv_set OBFS "$obfs"; hv_set AUTH "$auth"; hv_set UP "$up"; hv_set DOWN "$down"
+  hv_set AUTHMODE "$authmode"; hv_set RANGE "$rg"
   hv_set SSHPORTS "$(hv_ssh_ports)"
   hv_make_cert || return 1
   hv_open_port "$port"
@@ -3090,11 +3194,19 @@ hv_show(){
   printf ' %-16s %s\n' "Servidor:" "$(public_ip)"
   printf ' %-16s %s\n' "Puerto UDP:" "$(hv_get PORT)"
   printf ' %-16s %s\n' "OBFS:" "$(hv_get OBFS)"
-  printf ' %-16s %s\n' "Contraseña:" "$(hv_get AUTH)"
+  if [ "$(hv_authmode)" = hwid ]; then
+    printf ' %-16s %s\n' "Autenticacion:" "HWID (dejar vacia la contraseña en la app)"
+  else
+    printf ' %-16s %s\n' "Autenticacion:" "Contraseña fija"
+    printf ' %-16s %s\n' "Contraseña:" "$(hv_get AUTH)"
+  fi
+  printf ' %-16s %s\n' "Rango de puertos:" "$(hv_get RANGE | sed 's/^$/(sin rango)/')"
   printf ' %-16s %s\n' "Up/Down Mbps:" "$(hv_get UP)/$(hv_get DOWN)"
   printf ' %-16s %s\n' "Destino SSH:" "127.0.0.1:$(hv_get SSHPORTS | awk '{print $1}')"
   echo
+  if [ "$(hv_authmode)" = hwid ]; then info "Solo entran los HWID creados en el panel (los mismos que usan para el SSH) y no vencidos."; fi
   info "El login sigue siendo por SSH (usuarios HWID del panel). Hysteria solo lleva el tunel hasta el SSH local."
+  if [ -n "$(hv_get RANGE)" ]; then info "Abre tambien el rango UDP $(hv_get RANGE) en el firewall del proveedor del VPS."; fi
 }
 hv_change_port(){
   hv_installed || { warn "Instala primero."; return 0; }
@@ -3107,9 +3219,37 @@ hv_change_port(){
 hv_change_creds(){
   hv_installed || { warn "Instala primero."; return 0; }
   local o a; ask o " Nuevo OBFS (Enter = aleatorio): "; o="${o:-$(hv_rand 16)}"
-  ask a " Nueva contraseña (Enter = aleatoria): "; a="${a:-$(hv_rand 20)}"
-  valid_secret "$o" && valid_secret "$a" || { fail "Solo letras, numeros . _ @ - (4 a 128)."; return 1; }
-  hv_set OBFS "$o"; hv_set AUTH "$a"; hv_apply && { echo; hv_show; warn "Actualiza estos datos en la app de tus clientes."; }
+  valid_secret "$o" || { fail "Solo letras, numeros . _ @ - (4 a 128)."; return 1; }
+  if [ "$(hv_authmode)" = password ]; then
+    ask a " Nueva contraseña (Enter = aleatoria): "; a="${a:-$(hv_rand 20)}"
+    valid_secret "$a" || { fail "Solo letras, numeros . _ @ - (4 a 128)."; return 1; }
+    hv_set AUTH "$a"
+  fi
+  hv_set OBFS "$o"; hv_apply && { echo; hv_show; warn "Actualiza estos datos en la app de tus clientes."; }
+}
+hv_change_auth(){
+  hv_installed || { warn "Instala primero."; return 0; }
+  local am a cur; cur="$(hv_authmode)"
+  info "Autenticacion actual: $([ "$cur" = hwid ] && echo HWID || echo 'contraseña fija')"
+  ask am " [1] HWID (contraseña vacia en la app)  [2] Contraseña fija  (Enter = sin cambios): "
+  case "$am" in
+    1) hv_set AUTHMODE hwid;;
+    2) ask a " Contraseña (Enter = aleatoria): "; a="${a:-$(hv_rand 20)}"
+       valid_secret "$a" || { fail "Solo letras, numeros . _ @ - (4 a 128)."; return 1; }
+       if [ "$a" = "crisdev" ]; then fail "No uses 'crisdev': es publico."; return 1; fi
+       hv_set AUTHMODE password; hv_set AUTH "$a";;
+    *) info "Sin cambios."; return 0;;
+  esac
+  hv_apply && { echo; hv_show; warn "Actualiza estos datos en la app de tus clientes."; }
+}
+hv_change_range(){
+  hv_installed || { warn "Instala primero."; return 0; }
+  local rg; info "Rango actual: $(hv_get RANGE | sed 's/^$/ninguno/')"
+  ask rg " Nuevo rango UDP (ej. 20000-50000, 0 = quitar, Enter = sin cambios): "; rg="${rg// /}"
+  [ -n "$rg" ] || { info "Sin cambios."; return 0; }
+  if [ "$rg" = 0 ]; then hv_set RANGE ""
+  else hv_check_range "$rg" "$(hv_get PORT)" || return 1; hv_set RANGE "$HV_RG"; fi
+  hv_apply && { echo; hv_show; warn "Pon el mismo rango en el campo 'Puerto o rango' de la app."; }
 }
 hv_uninstall(){
   need_root; hv_installed || { info "No esta instalado."; return 0; }
@@ -3123,22 +3263,26 @@ hv_uninstall(){
   ok "Hysteria v1 desinstalado."
 }
 hv_menu(){
-  need_root; local op
+  need_root; local op r
   while true; do
     clear 2>/dev/null || true; calc_w
     title "ADMINISTRADOR HYSTERIA v1 (SSH)"
     if hv_installed; then
       printf ' %bUDP :%b %s   ' "$GY" "$WH" "$(hv_get PORT)"; hv_active && tag on || tag off; echo
+      r="$(hv_get RANGE)"
+      printf ' %bAuth:%b %s   %bRango:%b %s\n' "$GY" "$WH" "$([ "$(hv_authmode)" = hwid ] && echo HWID || echo CLAVE)" "$GY" "$WH" "${r:--}"
     else printf ' %bHysteria v1 sin instalar%b\n' "$GY" "$C_O"; fi
     dash
     item 1 "INSTALAR / REINSTALAR"
     item 2 "VER DATOS PARA LA APP"
     item 3 "CAMBIAR PUERTO"
     item 4 "CAMBIAR OBFS / CONTRASEÑA"
-    item 5 "REINICIAR"
-    item 6 "DETENER"
-    item 7 "VER LOGS"
-    item 8 "[!] DESINSTALAR" "$OR"
+    item 5 "AUTENTICACION (HWID / CONTRASEÑA)"
+    item 6 "RANGO DE PUERTOS (SALTO)"
+    item 7 "REINICIAR"
+    item 8 "DETENER"
+    item 9 "VER LOGS"
+    item 10 "[!] DESINSTALAR" "$OR"
     hl; printf ' %b[0]%b %b Volver %b\n' "$GY" "$C_O" "$BGR" "$C_O"; hl
     ask_op op
     case "$op" in
@@ -3146,10 +3290,12 @@ hv_menu(){
       2) hv_show; pause;;
       3) hv_change_port; pause;;
       4) hv_change_creds; pause;;
-      5) if hv_installed; then hv_apply; else warn "No esta instalado."; fi; pause;;
-      6) systemctl stop "$HV_UNIT_NAME" 2>/dev/null; warn "Detenido (vuelve a arrancar con Reiniciar)."; pause;;
-      7) journalctl -u "$HV_UNIT_NAME" -n 50 --no-pager 2>/dev/null || info "Sin logs."; pause;;
-      8) hv_uninstall; pause;;
+      5) hv_change_auth; pause;;
+      6) hv_change_range; pause;;
+      7) if hv_installed; then hv_apply; else warn "No esta instalado."; fi; pause;;
+      8) systemctl stop "$HV_UNIT_NAME" 2>/dev/null; warn "Detenido (vuelve a arrancar con Reiniciar)."; pause;;
+      9) journalctl -u "$HV_UNIT_NAME" -n 50 --no-pager 2>/dev/null || info "Sin logs."; pause;;
+      10) hv_uninstall; pause;;
       0) return 0;;
       *) echo " Opcion invalida"; sleep 1;;
     esac
@@ -3164,9 +3310,9 @@ hv_menu(){
 db_all(){ [ -f "$USR_DB" ] && grep -E '^[^|#]+\|' "$USR_DB" || true; }
 db_row(){ [ -f "$USR_DB" ] && awk -F'|' -v u="$1" '$1==u' "$USR_DB" | head -1 || true; }
 db_field(){ db_row "$1" | cut -d'|' -f"$2"; }
-db_del(){ [ -f "$USR_DB" ] || return 0; awk -F'|' -v u="$1" '$1!=u' "$USR_DB" > "$USR_DB.tmp"; mv "$USR_DB.tmp" "$USR_DB"; chmod 600 "$USR_DB"; }
+db_del(){ [ -f "$USR_DB" ] || return 0; awk -F'|' -v u="$1" '$1!=u' "$USR_DB" > "$USR_DB.tmp"; mv "$USR_DB.tmp" "$USR_DB"; chmod 600 "$USR_DB"; hv_sync_hwids; }
 db_put(){ mkdir -p "$(dirname "$USR_DB")"; [ -f "$USR_DB" ] || : > "$USR_DB"; db_del "$1"
-  printf '%s|%s|%s|%s\n' "$1" "$2" "$3" "$4" >> "$USR_DB"; chmod 600 "$USR_DB"; }
+  printf '%s|%s|%s|%s\n' "$1" "$2" "$3" "$4" >> "$USR_DB"; chmod 600 "$USR_DB"; hv_sync_hwids; }
 days_left(){ local e t; e="$(date -u -d "$1" +%s 2>/dev/null)" || { echo -9999; return; }
   t="$(date -u -d "$(date +%F)" +%s)"; echo $(( (e - t) / 86400 )); }
 user_locked(){ passwd -S "$1" 2>/dev/null | awk '{print $2}' | grep -q '^L'; }
