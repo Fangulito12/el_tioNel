@@ -12,7 +12,7 @@
 set -u
 
 BRAND="el_tioNel"
-PANEL_VERSION="3.1"
+PANEL_VERSION="3.0"
 SIGNATURE_HASH="4dd04f82206489e290924281267bef53fec179fff49f13c453132c4c2a166b5c"
 verify_signature(){
   local src hash
@@ -38,6 +38,9 @@ BH_PORTS="$ROOT/etc/${BRAND}-bhttp/ports"
 BH_TUNE="$ROOT/etc/sysctl.d/99-${BRAND}-bhttp.conf"
 XR_BIN="$ROOT/opt/${BRAND}-xray/${BRAND}-xray"
 XR_STATE="$ROOT/etc/${BRAND}-xray/state"
+HCR_MGR="$SBIN/${BRAND}-hcr-manager";      HCR_LINK="$UBIN/${BRAND}-hcr"
+HCR_BIN="$ROOT/etc/hcr-server/hcr-server"
+HCR_PORTS="$ROOT/etc/hcr-server/ports.conf"
 
 # ---- aspecto: UTF-8 si la terminal lo soporta, ASCII si no
 case "${LC_ALL:-${LC_CTYPE:-${LANG:-}}}" in *[Uu][Tt][Ff]-8*|*[Uu][Tt][Ff]8*) UTF=1;; *) UTF=0;; esac
@@ -2621,7 +2624,7 @@ ui_status(){
   line "Puerto:" "$(st_get PORT) ($(listening "$(st_get PORT)" && echo escuchando || echo 'NO escucha'))"
   line "Camuflaje:" "$(st_get SNI)"
   line "IP:" "$(st_get IP)"
-  line "Usuarios:" "$(grep -c . "$USERS" 2>/dev/null || true)"
+  line "Usuarios:" "$(grep -c . "$USERS" 2>/dev/null || echo 0)"
 }
 menu(){
   need_root
@@ -2670,10 +2673,371 @@ main(){
 main "$@"
 EMBED_XRAY_MANAGER_EOF
 }
+emit_hcr_manager(){
+cat <<'EMBED_HCR_MANAGER_EOF'
+#!/usr/bin/env bash
+# el_tioNel HCR - administrador (lo usa el panel "el_tioNel", pero tambien funciona solo).
+# Uso:  el_tioNel-hcr                 (abre el menu)
+#       el_tioNel-hcr install         (descarga el binario hcr-server)
+#       el_tioNel-hcr add-port 8080   (perfil TURBO por defecto)
+#       el_tioNel-hcr optimize        (aplica el perfil de velocidad a todos los puertos + ajuste de red)
+set -u
+
+BRAND="el_tioNel"
+NAME="${BRAND}-hcr"
+CMD="$NAME"
+MANAGER_VERSION="1.0"
+ROOT="${HCR_ROOT:-}"                             # solo para pruebas; en uso normal queda vacio
+
+# Mismas rutas y servicios que el script hcr original: tus puertos actuales se reconocen solos.
+INSTALL_DIR="$ROOT/etc/hcr-server"
+BINARY_PATH="$INSTALL_DIR/hcr-server"
+PORTS_FILE="$INSTALL_DIR/ports.conf"
+UNIT_DIR="$ROOT/etc/systemd/system"
+SERVICE_PREFIX="hcr"
+BINARY_URL="https://www.dropbox.com/scl/fi/pz28qnrdm9box9267ok0i/hcr-server.bin?rlkey=y1x8ryvgx3wb4hwtf2hn62lag&st=c5d3zvl3&dl=1"
+BH_MGR="$ROOT/usr/local/sbin/${BRAND}-bhttp-manager"          # se reutiliza su ajuste de red (BBR, buffers)
+BH_TUNE="$ROOT/etc/sysctl.d/99-${BRAND}-bhttp.conf"
+
+DEFAULT_TARGET="127.0.0.1:22"
+DEFAULT_TRANSPORT="plain"
+MAX_FRAME_LIMIT=16384
+# Perfil TURBO: frame maximo que admite el protocolo + espera corta.
+TURBO_FRAME=16384
+TURBO_POLL=2
+
+if [ -t 1 ]; then C_OK='\033[1;32m'; C_ERR='\033[1;31m'; C_INF='\033[1;36m'; C_WRN='\033[1;33m'; C_OFF='\033[0m'
+else C_OK=''; C_ERR=''; C_INF=''; C_WRN=''; C_OFF=''; fi
+case "${LC_ALL:-${LC_CTYPE:-${LANG:-}}}" in *[Uu][Tt][Ff]-8*|*[Uu][Tt][Ff]8*) UI_UTF=1;; *) UI_UTF=0;; esac
+if [ "$UI_UTF" -eq 1 ]; then HZ='═'; else HZ='='; fi
+if [ -t 1 ]; then RD='\033[1;31m'; WH='\033[1;37m'; GY='\033[0;37m'; OR='\033[38;5;208m'; GN='\033[1;32m'; BGR='\033[41;1;37m'
+else RD=''; WH=''; GY=''; OR=''; GN=''; BGR=''; fi
+W=54
+calc_w(){ local c; c="$(tput cols 2>/dev/null || echo 54)"; [[ "$c" =~ ^[0-9]+$ ]] || c=54
+  [ "$c" -gt 54 ] && c=54; [ "$c" -lt 40 ] && c=40; W="$c"; }
+rep_char(){ local i out=""; for ((i = 0; i < $2; i++)); do out+="$1"; done; printf '%s' "$out"; }
+hl(){ printf '%b%s%b\n' "$RD" "$(rep_char "$HZ" "$W")" "$C_OFF"; }
+dash(){ printf '%b%s%b\n' "$RD" "$(rep_char "-" "$W")" "$C_OFF"; }
+title(){ local t="$1" pad; pad=$(( (W - ${#t}) / 2 )); [ "$pad" -lt 0 ] && pad=0
+  hl; printf '%*s%b%s%b\n' "$pad" "" "$GY" "$t" "$C_OFF"; hl; }
+item(){ local col="${3:-$WH}"; printf ' %b[%s]%b>%b %b%s%b\n' "$GY" "$1" "$RD" "$C_OFF" "$col" "$2" "$C_OFF"; }
+tag(){ case "$1" in on) printf '%b%s%b' "$GN" "[ON]" "$C_OFF";; off) printf '%b%s%b' "$RD" "[OFF]" "$C_OFF";; *) printf '%b%s%b' "$GY" "[--]" "$C_OFF";; esac; }
+line(){ printf ' %b%-15s%b %s\n' "$GY" "$1" "$WH" "$2"; printf '%b' "$C_OFF"; }
+back(){ hl; printf ' %b[0]%b %b %s %b\n' "$GY" "$C_OFF" "$BGR" "${1:-Volver}" "$C_OFF"; hl; }
+ask_op(){ ask "$1" "$(printf '\n%b Ingresa una Opcion: %b' "$GY" "$C_OFF")"; }
+ok(){ printf '%b✔%b %s\n' "$C_OK" "$C_OFF" "$*"; }
+info(){ printf '%bℹ%b %s\n' "$C_INF" "$C_OFF" "$*"; }
+warn(){ printf '%b⚠%b %s\n' "$C_WRN" "$C_OFF" "$*"; }
+fail(){ printf '%b✘%b %s\n' "$C_ERR" "$C_OFF" "$*" >&2; }
+have(){ command -v "$1" >/dev/null 2>&1; }
+need_root(){
+  [ -n "${HCR_TEST:-}" ] && return 0
+  [ "$(id -u)" -eq 0 ] || { fail "Ejecuta como root (sudo)."; exit 1; }
+}
+ask(){ local __v="$1"; IFS= read -r -p "$2" "$__v" || eval "$__v=''"; }
+pause(){ [ -t 0 ] || return 0; echo; local _; ask _ "Presiona ENTER para continuar..."; }
+confirm_word(){            # confirm_word PALABRA "mensaje"
+  [ -n "${HCR_YES:-}" ] && return 0
+  local c; ask c "$2 Escribe $1 para confirmar: "; [ "$c" = "$1" ]
+}
+valid_port(){ [[ "${1:-}" =~ ^[0-9]+$ ]] && [ "$1" -ge 1 ] && [ "$1" -le 65535 ]; }
+valid_frame(){ [[ "${1:-}" =~ ^[0-9]+$ ]] && [ "$1" -ge 1 ] && [ "$1" -le "$MAX_FRAME_LIMIT" ]; }
+valid_poll(){ [[ "${1:-}" =~ ^[0-9]+(\.[0-9]+)?$ ]] && awk "BEGIN{exit !($1 > 0)}"; }
+listening(){ ss -lnt 2>/dev/null | awk -v p=":$1" '$4 ~ p"$" {f=1} END{exit !f}'; }
+
+# ---------------------------------------------------------------- puertos (formato ports.conf del hcr original)
+svc(){ echo "${SERVICE_PREFIX}-$1.service"; }
+unit_path(){ echo "$UNIT_DIR/$(svc "$1")"; }
+ports_list(){ [ -s "$PORTS_FILE" ] && awk -F'|' '$1 ~ /^[0-9]+$/ {print $1}' "$PORTS_FILE" | sort -n -u || true; }
+ports_has(){ grep -q "^$1|" "$PORTS_FILE" 2>/dev/null; }
+port_line(){ grep -m1 "^$1|" "$PORTS_FILE" 2>/dev/null; }
+port_save(){ mkdir -p "$INSTALL_DIR"; touch "$PORTS_FILE"; chmod 600 "$PORTS_FILE" 2>/dev/null || true
+  sed -i "/^$1|/d" "$PORTS_FILE" 2>/dev/null || true; echo "$1|$2|$3|$4|$5" >> "$PORTS_FILE"; }
+port_forget(){ sed -i "/^$1|/d" "$PORTS_FILE" 2>/dev/null || true; }
+installed(){ [ -x "$BINARY_PATH" ]; }
+port_active(){ systemctl is-active --quiet "$(svc "$1")" 2>/dev/null; }
+
+# Si ya tenias puertos creados con el script hcr original, los registra solos.
+reconcile_ports(){
+  local f p ex tg tr fr po
+  for f in "$UNIT_DIR"/${SERVICE_PREFIX}-*.service; do
+    [ -e "$f" ] || continue
+    p="$(basename "$f" .service)"; p="${p#${SERVICE_PREFIX}-}"
+    [[ "$p" =~ ^[0-9]+$ ]] || continue
+    ports_has "$p" && continue
+    ex="$(grep -m1 '^ExecStart=' "$f" 2>/dev/null)" || true
+    [ -n "$ex" ] || continue
+    tg="$(grep -oE -- '--target [^ ]+' <<< "$ex" | awk '{print $2}')" || true
+    tr="$(grep -oE -- '--transport [^ ]+' <<< "$ex" | awk '{print $2}')" || true
+    fr="$(grep -oE -- '--max-download-frame [^ ]+' <<< "$ex" | awk '{print $2}')" || true
+    po="$(grep -oE -- '--download-poll-timeout [^ ]+' <<< "$ex" | awk '{print $2}')" || true
+    port_save "$p" "${tr:-$DEFAULT_TRANSPORT}" "${tg:-$DEFAULT_TARGET}" "${fr:-$TURBO_FRAME}" "${po%s}"
+  done
+}
+
+# ---------------------------------------------------------------- servicio (sin los limites que frenaban la velocidad)
+write_unit(){          # write_unit PUERTO TRANSPORTE TARGET FRAME POLL
+  local port="$1" transport="$2" target="$3" frame="$4" poll="$5" tls=""
+  if [ "$transport" = tls ] || [ "$transport" = auto ]; then
+    if [ -f "$INSTALL_DIR/fullchain.pem" ] && [ -f "$INSTALL_DIR/privkey.pem" ]; then
+      tls=" --tls-cert $INSTALL_DIR/fullchain.pem --tls-key $INSTALL_DIR/privkey.pem"
+    else warn "Transport $transport necesita certificados en $INSTALL_DIR. Se usa plain."; transport=plain; fi
+  fi
+  mkdir -p "$UNIT_DIR"
+  cat > "$(unit_path "$port")" <<EOF
+[Unit]
+Description=HCR relay on port $port ($BRAND, modo velocidad)
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=exec
+User=root
+Group=root
+WorkingDirectory=$INSTALL_DIR
+ExecStart=$BINARY_PATH --listen :$port --target $target --transport $transport$tls --max-download-frame $frame --download-poll-timeout ${poll}s
+Restart=always
+RestartSec=2s
+TimeoutStopSec=15s
+KillSignal=SIGTERM
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadOnlyPaths=$INSTALL_DIR
+# --- velocidad: sin el tope de 4096 archivos / 512 tareas / 384 MB del script original ---
+LimitNOFILE=524288
+LimitNPROC=infinity
+TasksMax=infinity
+LimitCORE=0
+Nice=-5
+CPUSchedulingPolicy=other
+Environment=GOGC=200
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=hcr-$port
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  chmod 644 "$(unit_path "$port")"
+}
+start_port(){ systemctl daemon-reload; systemctl enable --now "$(svc "$1")" >/dev/null 2>&1; }
+stop_port(){ systemctl disable --now "$(svc "$1")" >/dev/null 2>&1 || true; }
+remove_port(){ stop_port "$1"; rm -f "$(unit_path "$1")"; port_forget "$1"; systemctl daemon-reload; }
+
+diagnose(){
+  local log; log="$(journalctl -u "$(svc "$1")" -n 20 --no-pager 2>/dev/null)"
+  if grep -qi "address already in use" <<< "$log"; then fail "Puerto $1: ya esta en uso por otro proceso."
+  elif grep -qi "exceeds the protocol maximum" <<< "$log"; then fail "Puerto $1: el frame supera el maximo del protocolo ($MAX_FRAME_LIMIT)."
+  elif grep -qi "permission denied" <<< "$log"; then fail "Puerto $1: permiso denegado."
+  elif grep -qi "no such file" <<< "$log"; then fail "Puerto $1: falta un archivo (target, certificados o binario)."
+  else fail "Puerto $1: no arranco. Ultimas lineas:"; printf '%s\n' "$log" | tail -5 | sed 's/^/    /'; fi
+}
+provision(){           # provision PUERTO TRANSPORTE TARGET FRAME POLL
+  port_save "$@"; write_unit "$@"; start_port "$1"; sleep 1
+  if port_active "$1" && listening "$1"; then ok "Puerto $1 iniciado (frame $4, poll ${5}s, transport $2)."
+  else diagnose "$1"; return 1; fi
+}
+
+# ---------------------------------------------------------------- binario
+download_binary(){
+  need_root; have curl || { fail "Falta curl."; return 1; }
+  mkdir -p "$INSTALL_DIR"; local tmp="/tmp/hcr-server.$$"
+  info "Descargando hcr-server..."
+  if curl -fsSL -L -o "$tmp" "$BINARY_URL"; then
+    chmod +x "$tmp"
+    if "$tmp" -version 2>/dev/null | grep -q "hcr-server version"; then
+      mv -f "$tmp" "$BINARY_PATH"; chown root:root "$BINARY_PATH"; chmod 755 "$BINARY_PATH"
+      ok "Binario instalado/actualizado."; "$BINARY_PATH" -version 2>/dev/null || true
+    else rm -f "$tmp"; fail "El archivo descargado no es un binario hcr-server valido."; return 1; fi
+  else rm -f "$tmp"; fail "No se pudo descargar (revisa conectividad o la URL)."; return 1; fi
+}
+do_install(){
+  need_root; mkdir -p "$INSTALL_DIR"; touch "$PORTS_FILE"; chmod 600 "$PORTS_FILE"
+  if installed; then
+    info "Binario actual:"; "$BINARY_PATH" -version 2>/dev/null || true
+    local r; ask r "Re-descargar/actualizar? [s/N]: "; case "${r,,}" in s|si) ;; *) ok "Se mantiene el binario actual."; return 0;; esac
+  fi
+  download_binary || return 1
+  reconcile_ports
+}
+
+# ---------------------------------------------------------------- ajuste de red (el mismo del panel/bhttp: BBR, fq, buffers, fastopen)
+tuning_state(){ [ -f "$BH_TUNE" ] && echo on || echo off; }
+tuning_on(){ [ -x "$BH_MGR" ] || { warn "No esta el administrador de ajuste de red. Abre el panel $BRAND una vez."; return 1; }; "$BH_MGR" tuning-on; }
+tuning_off(){ [ -x "$BH_MGR" ] || return 0; "$BH_MGR" tuning-off; }
+
+# ---------------------------------------------------------------- acciones
+ask_profile(){        # deja en P_TRANSPORT P_TARGET P_FRAME P_POLL
+  P_TRANSPORT="$DEFAULT_TRANSPORT"; P_TARGET="$DEFAULT_TARGET"
+  echo; item 1 "TURBO  (frame $TURBO_FRAME, poll ${TURBO_POLL}s)  <- recomendado"; item 2 "Rapido (frame 2000, poll 4s)"
+  item 3 "Estable (frame 6000, poll 6s)"; item 4 "Personalizar"; item 0 "Volver"
+  local o; ask_op o
+  case "$o" in
+    1) P_FRAME=$TURBO_FRAME; P_POLL=$TURBO_POLL;;
+    2) P_FRAME=2000; P_POLL=4;;
+    3) P_FRAME=6000; P_POLL=6;;
+    4) ask P_TRANSPORT "Transport plain/tls/auto [plain]: "; P_TRANSPORT="${P_TRANSPORT:-plain}"
+       case "$P_TRANSPORT" in plain|tls|auto) ;; *) fail "Transport no admitido."; return 1;; esac
+       ask P_TARGET "Target SSH [$DEFAULT_TARGET]: "; P_TARGET="${P_TARGET:-$DEFAULT_TARGET}"
+       ask P_FRAME "Max frame (1-$MAX_FRAME_LIMIT) [$TURBO_FRAME]: "; P_FRAME="${P_FRAME:-$TURBO_FRAME}"
+       valid_frame "$P_FRAME" || { fail "Frame invalido (1-$MAX_FRAME_LIMIT)."; return 1; }
+       ask P_POLL "Poll timeout en segundos, solo numero [$TURBO_POLL]: "; P_POLL="${P_POLL:-$TURBO_POLL}"
+       valid_poll "$P_POLL" || { fail "Poll invalido (numero mayor a 0)."; return 1; };;
+    0) return 2;; *) fail "Opcion invalida."; return 1;;
+  esac
+}
+add_port(){           # add_port [PUERTO]  (con puerto como argumento usa el perfil TURBO sin preguntar)
+  need_root; installed || { fail "Primero instala el binario (opcion 1)."; return 1; }
+  local p="${1:-}" quick=0; [ -n "$p" ] && quick=1
+  [ -n "$p" ] || ask p "Puerto a usar (1-65535): "
+  valid_port "$p" || { fail "Puerto invalido."; return 1; }
+  if ports_has "$p"; then
+    if port_active "$p"; then info "El puerto $p ya esta en ejecucion."; return 0; fi
+    local l t tg fr po; l="$(port_line "$p")"; IFS='|' read -r _ t tg fr po <<< "$l"
+    write_unit "$p" "$t" "$tg" "$fr" "$po"; start_port "$p"; sleep 1
+    port_active "$p" && ok "Puerto $p reiniciado." || diagnose "$p"; return 0
+  fi
+  listening "$p" && { fail "El puerto $p ya esta en uso por otro proceso."; return 1; }
+  P_TRANSPORT="$DEFAULT_TRANSPORT"; P_TARGET="$DEFAULT_TARGET"; P_FRAME=$TURBO_FRAME; P_POLL=$TURBO_POLL
+  if [ "$quick" -eq 0 ]; then local rc=0; ask_profile || rc=$?; [ "$rc" -eq 0 ] || return 0; fi
+  provision "$p" "$P_TRANSPORT" "$P_TARGET" "$P_FRAME" "$P_POLL"
+}
+toggle_port(){
+  need_root; local p; ask p "Puerto: "; ports_has "$p" || { fail "El puerto $p no esta configurado."; return 1; }
+  if port_active "$p"; then stop_port "$p"; ok "Puerto $p detenido."
+  else start_port "$p"; sleep 1; port_active "$p" && ok "Puerto $p reactivado." || diagnose "$p"; fi
+}
+edit_port(){
+  need_root; local old new l t tg fr po nt ntg nf np
+  ask old "Puerto a editar: "; ports_has "$old" || { fail "El puerto $old no esta configurado."; return 1; }
+  l="$(port_line "$old")"; IFS='|' read -r _ t tg fr po <<< "$l"
+  ask new "Nuevo puerto [$old]: "; new="${new:-$old}"
+  if [ "$new" != "$old" ]; then valid_port "$new" || { fail "Puerto invalido."; return 1; }
+    ports_has "$new" || ! listening "$new" || { fail "El puerto $new ya esta en uso."; return 1; }; fi
+  ask nt "Transport [$t]: "; nt="${nt:-$t}"; case "$nt" in plain|tls|auto) ;; *) fail "Transport no admitido."; return 1;; esac
+  ask ntg "Target [$tg]: "; ntg="${ntg:-$tg}"
+  ask nf "Max frame [$fr]: "; nf="${nf:-$fr}"; valid_frame "$nf" || { fail "Frame invalido (1-$MAX_FRAME_LIMIT)."; return 1; }
+  ask np "Poll timeout s [$po]: "; np="${np:-$po}"; valid_poll "$np" || { fail "Poll invalido."; return 1; }
+  remove_port "$old"; provision "$new" "$nt" "$ntg" "$nf" "$np" && ok "Puerto actualizado: $old -> $new"
+}
+del_port(){
+  need_root; local p; ask p "Puerto a eliminar: "; ports_has "$p" || { fail "El puerto $p no esta configurado."; return 1; }
+  confirm_word SI "Eliminar el puerto $p." || { info "Sin cambios."; return 0; }
+  remove_port "$p"; ok "Puerto $p eliminado."
+}
+# Reescribe TODAS las unidades con los limites altos (y opcionalmente el perfil TURBO) y reinicia.
+optimize(){
+  need_root; installed || { fail "Primero instala el binario."; return 1; }
+  reconcile_ports; local ps p l t tg fr po; ps="$(ports_list)"
+  [ -n "$ps" ] || info "No hay puertos todavia: crea uno con la opcion 2 (ya sale en perfil TURBO)."
+  local r=n
+  if [ -n "$ps" ]; then ask r "Aplicar tambien frame $TURBO_FRAME y poll ${TURBO_POLL}s a todos los puertos? [s/N]: "; fi
+  for p in $ps; do
+    l="$(port_line "$p")"; IFS='|' read -r _ t tg fr po <<< "$l"
+    case "${r,,}" in s|si) fr=$TURBO_FRAME; po=$TURBO_POLL;; esac
+    port_save "$p" "$t" "$tg" "$fr" "$po"; write_unit "$p" "$t" "$tg" "$fr" "$po"
+  done
+  systemctl daemon-reload
+  for p in $ps; do systemctl restart "$(svc "$p")" >/dev/null 2>&1 || true; done
+  [ "$(tuning_state)" = on ] || tuning_on || true
+  ok "Optimizado: limites altos (archivos/tareas/RAM), prioridad de CPU y ajuste de red."
+}
+restart_all(){ local p n=0; for p in $(ports_list); do systemctl restart "$(svc "$p")" >/dev/null 2>&1 && n=$((n+1)); done
+  [ "$n" -gt 0 ] && ok "Reiniciados $n puerto(s) HCR." || info "No hay puertos HCR."; }
+show_logs(){ local p="${1:-}"; [ -n "$p" ] || ask p "Puerto: "; ports_has "$p" || { fail "El puerto $p no esta configurado."; return 1; }
+  journalctl -u "$(svc "$p")" -n 40 --no-pager 2>/dev/null || info "Sin logs."; }
+status(){
+  reconcile_ports; echo "===== HCR ====="
+  if installed; then "$BINARY_PATH" -version 2>/dev/null | head -1 || true; else warn "Binario sin instalar."; fi
+  local p l t tg fr po any=0
+  for p in $(ports_list); do any=1; l="$(port_line "$p")"; IFS='|' read -r _ t tg fr po <<< "$l"
+    printf ' :%-6s %-4s transport=%s target=%s frame=%s poll=%ss\n' "$p" "$(port_active "$p" && echo ON || echo OFF)" "$t" "$tg" "$fr" "$po"; done
+  [ "$any" -eq 1 ] || info "Sin puertos configurados."
+  echo "Ajuste de red: $(tuning_state) | congestion TCP: $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo '?')"
+  if [ "$any" -eq 1 ]; then
+    local lim; lim="$(systemctl show "$(svc "$(ports_list | head -1)")" -p LimitNOFILE --value 2>/dev/null)"
+    echo "Limite de archivos (1er puerto): ${lim:-?}"
+  fi
+}
+do_uninstall(){
+  need_root; confirm_word HCR "Se detienen y eliminan TODOS los puertos HCR y el binario." || { info "Sin cambios."; return 0; }
+  local p; for p in $(ports_list); do remove_port "$p"; done
+  rm -f "$UNIT_DIR"/${SERVICE_PREFIX}-*.service; rm -rf "$INSTALL_DIR"; systemctl daemon-reload
+  ok "HCR desinstalado (el ajuste de red se quita desde el menu de BHTTP/Herramientas)."
+}
+
+# ---------------------------------------------------------------- menu
+menu(){
+  need_root; local op st
+  while true; do
+    clear 2>/dev/null || true; calc_w; reconcile_ports
+    title "HCR  (modo velocidad)"
+    if installed; then line "Binario:" "instalado"; else line "Binario:" "sin instalar (opcion 1)"; fi
+    local p ps=""; for p in $(ports_list); do port_active "$p" && st=on || st=off; ps+="$p$( [ $st = on ] && echo '*') "; done
+    line "Puertos:" "${ps:-ninguno}  (* = activo)"
+    line "Ajuste red:" "$(tuning_state) | $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo '?')"
+    dash
+    item 1 "INSTALAR / ACTUALIZAR HCR-SERVER"
+    item 2 "AGREGAR PUERTO"
+    item 3 "DETENER / REACTIVAR PUERTO"
+    item 4 "EDITAR PUERTO"
+    item 5 "ELIMINAR PUERTO"
+    item 6 "VER LOGS DE UN PUERTO"
+    dash
+    item 7 "OPTIMIZAR VELOCIDAD (todos los puertos)" "$OR"
+    tuning_state | grep -q on && st=on || st=off; printf ' %b[8]%b>%b %-30s ' "$GY" "$RD" "$WH" "AJUSTE DE RED (BBR/buffers)"; tag "$st"; printf '%b\n' "$C_OFF"
+    item 9 "DESINSTALAR HCR" "$OR"
+    back "Volver"
+    ask_op op
+    case "$op" in
+      1) do_install; pause;; 2) add_port; pause;; 3) toggle_port; pause;; 4) edit_port; pause;;
+      5) del_port; pause;; 6) show_logs; pause;; 7) optimize; pause;;
+      8) if [ -f "$BH_TUNE" ]; then tuning_off; else tuning_on; fi; pause;;
+      9) do_uninstall; pause;;
+      0) return 0;; *) echo " Opcion invalida"; sleep 1;;
+    esac
+  done
+}
+usage(){ cat <<EOF
+$CMD $MANAGER_VERSION - administrador HCR (modo velocidad)
+  $CMD                    menu
+  $CMD install            descarga/actualiza el binario hcr-server
+  $CMD add-port PUERTO    crea un puerto con el perfil TURBO
+  $CMD optimize           limites altos + ajuste de red en todos los puertos
+  $CMD tuning-on | tuning-off   ajuste de red (BBR y buffers)
+  $CMD restart | status | logs PUERTO | uninstall
+EOF
+}
+main(){
+  local a="${1:-menu}"; [ $# -gt 0 ] && shift
+  case "$a" in
+    menu|"") menu;;
+    install) do_install;;
+    add-port) add_port "${1:-}";;
+    optimize) optimize;;
+    tuning-on) need_root; tuning_on;;
+    tuning-off) need_root; tuning_off;;
+    restart) need_root; restart_all;;
+    status) status;;
+    logs) show_logs "${1:-}";;
+    uninstall) do_uninstall;;
+    help|-h|--help) usage;;
+    *) usage; exit 2;;
+  esac
+}
+main "$@"
+EMBED_HCR_MANAGER_EOF
+}
 write_subs(){
   mkdir -p "$SBIN" "$UBIN"
   emit_bhttp_manager > "$BH_MGR"; chmod 755 "$BH_MGR"; ln -sfn "$BH_MGR" "$BH_LINK"
   emit_xray_manager  > "$XR_MGR"; chmod 755 "$XR_MGR"; ln -sfn "$XR_MGR" "$XR_LINK"
+  emit_hcr_manager   > "$HCR_MGR"; chmod 755 "$HCR_MGR"; ln -sfn "$HCR_MGR" "$HCR_LINK"
 }
 install_panel(){
   local src; src="$(readlink -f "${BASH_SOURCE[0]:-$0}" 2>/dev/null || echo "${BASH_SOURCE[0]:-$0}")"
@@ -2755,11 +3119,14 @@ bh_ports(){ [ -f "$BH_PORTS" ] && grep -E '^[0-9]+$' "$BH_PORTS" | sort -n -u | 
 bh_installed(){ [ -f "$BH_APP" ]; }
 bh_tls(){ grep -q '^TLS_ARGS=.' "$ROOT/etc/${BRAND}-bhttp/config" 2>/dev/null; }
 bh_active(){ local p; for p in $(bh_ports); do systemctl is-active --quiet "${BRAND}-bhttp@$p.service" 2>/dev/null && return 0; done; return 1; }
+hr_ports(){ [ -f "$HCR_PORTS" ] && awk -F'|' '$1 ~ /^[0-9]+$/ {print $1}' "$HCR_PORTS" | sort -n -u | tr '\n' ' ' | sed 's/ $//' || true; }
+hr_installed(){ [ -x "$HCR_BIN" ]; }
+hr_active(){ local p; for p in $(hr_ports); do systemctl is-active --quiet "hcr-$p.service" 2>/dev/null && return 0; done; return 1; }
 xr_installed(){ [ -x "$XR_BIN" ] && [ -f "$XR_STATE" ]; }
 xr_port(){ grep -m1 '^PORT=' "$XR_STATE" 2>/dev/null | cut -d= -f2; }
 xr_active(){ systemctl is-active --quiet "${BRAND}-xray.service" 2>/dev/null; }
-hy_active(){ pgrep -af '[h]ysteria' 2>/dev/null | grep -v "${BRAND}-hysteria" | grep -q . || systemctl list-units --type=service --state=active 2>/dev/null | grep -i hysteria | grep -qv "${BRAND}-hysteria"; }
-hy_port(){ ss -ulnp 2>/dev/null | grep -i hysteria | grep -v "${BRAND}-hysteria" | awk '{print $5}' | sed 's/.*://' | head -1; }
+hy_active(){ pgrep -f '[h]ysteria' >/dev/null 2>&1 || systemctl list-units --type=service --state=active 2>/dev/null | grep -qi hysteria; }
+hy_port(){ ss -ulnp 2>/dev/null | grep -i hysteria | awk '{print $5}' | sed 's/.*://' | head -1; }
 bbr_on(){ [ "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)" = "bbr" ]; }
 ufw_on(){ have ufw && ufw status 2>/dev/null | grep -q '^Status: active'; }
 conn_count(){ ss -tan 2>/dev/null | awk -v p=":$1" '$1=="ESTAB" && $4 ~ p"$" {n++} END{print n+0}'; }
@@ -2885,620 +3252,6 @@ ug_menu(){
 }
 
 # =====================================================================
-#  HYSTERIA v1  (transporte UDP/QUIC hacia el SSH del VPS)
-#  Reemplaza a BHTTP como transporte: la app abre un tunel Hysteria que
-#  llega SOLO al sshd local (127.0.0.1). El control por HWID sigue siendo
-#  el login SSH. Un usuario de sistema dedicado + reglas iptables impiden
-#  que el servicio Hysteria sirva de proxy abierto hacia internet.
-# =====================================================================
-HV_VER="v1.3.5"
-HV_USER="tionelhy"
-HV_DIR="$ROOT/etc/${BRAND}-hysteria"
-HV_STATE="$HV_DIR/state"
-HV_CONF="$HV_DIR/config.json"
-HV_APPDIR="$ROOT/opt/${BRAND}-hysteria"
-HV_BIN="$HV_APPDIR/${BRAND}-hysteria"
-HV_FW="$SBIN/${BRAND}-hysteria-fw"
-HV_UNIT_NAME="${BRAND}-hysteria.service"
-HV_UNIT="$ROOT/etc/systemd/system/$HV_UNIT_NAME"
-HV_AUTH="$HV_DIR/auth.sh"       # script de autenticacion por HWID (lo llama Hysteria)
-HV_HWIDS="$HV_DIR/hwids"       # lista HWID|vencimiento (la regenera el panel)
-HV_SYSCTL="$ROOT/etc/sysctl.d/99-${BRAND}-hysteria.conf"   # buffers UDP del kernel (opcional)
-HV_SYSPREV="$HV_DIR/sysctl.prev"                           # valores originales, para poder revertir
-HV_RG=""
-HV_EX=""
-
-hv_installed(){ [ -x "$HV_BIN" ] && [ -f "$HV_STATE" ]; }
-hv_get(){ grep -m1 "^$1=" "$HV_STATE" 2>/dev/null | cut -d= -f2-; }
-hv_set(){
-  mkdir -p "$HV_DIR"; [ -f "$HV_STATE" ] || : > "$HV_STATE"
-  grep -v "^$1=" "$HV_STATE" > "$HV_STATE.tmp" || true
-  printf '%s=%s\n' "$1" "$2" >> "$HV_STATE.tmp"; mv "$HV_STATE.tmp" "$HV_STATE"; chmod 600 "$HV_STATE"
-}
-hv_active(){ systemctl is-active --quiet "$HV_UNIT_NAME" 2>/dev/null; }
-# Modo de autenticacion: hwid | password (instalaciones viejas sin el dato = password)
-hv_authmode(){ local m; m="$(hv_get AUTHMODE)"; [ "$m" = hwid ] && echo hwid || echo password; }
-hv_valid_range(){
-  [[ "${1:-}" =~ ^([0-9]{1,5})-([0-9]{1,5})$ ]] || return 1
-  local a=$((10#${BASH_REMATCH[1]})) b=$((10#${BASH_REMATCH[2]}))
-  [ "$a" -ge 1 ] && [ "$b" -le 65535 ] && [ "$a" -le "$b" ]
-}
-# Puertos UDP (no locales) que ya escuchan dentro del rango, salvo el de Hysteria
-hv_range_conflicts(){
-  ss -lnu 2>/dev/null | awk -v lo="$1" -v hi="$2" -v own="$3" 'NR>1 {
-    a=$4; if (a ~ /^127\./ || a ~ /^\[::1\]/) next
-    n=split(a,x,":"); p=x[n]+0; if (p>=lo && p<=hi && p!=own) print p }' | sort -nu | tr '\n' ' ' | sed 's/ $//'
-}
-# Valida el rango y lo deja normalizado en HV_RG
-hv_check_range(){      # hv_check_range lo-hi puerto_hysteria
-  local r="$1" own="$2" lo hi c
-  hv_valid_range "$r" || { fail "Rango invalido. Usa el formato 20000-50000 (de 1 a 65535, menor-mayor)."; return 1; }
-  lo=$((10#${r%-*})); hi=$((10#${r#*-}))
-  c="$(hv_range_conflicts "$lo" "$hi" "$own")"
-  if [ -n "$c" ]; then fail "Ya hay servicios UDP escuchando dentro de ese rango (puerto(s): $c). Elige otro rango."; return 1; fi
-  if [ "$lo" -lt 1024 ]; then warn "Incluye puertos bajos: algunos operadores los filtran. Si no conecta, prueba 20000-50000."; fi
-  HV_RG="$lo-$hi"
-}
-# Script que Hysteria llama por cada conexion nueva: auth.sh <addr> <auth> <send> <recv>
-# Exit 0 = permitir. Solo deja pasar HWID creados en el panel (modo HWID) y no vencidos.
-hv_write_auth(){
-  [ "$(hv_authmode)" = hwid ] || return 0
-  mkdir -p "$HV_DIR"; chmod 755 "$HV_DIR" 2>/dev/null || true
-  cat > "$HV_AUTH" <<'HV_AUTH_EOF'
-#!/bin/sh
-# el_tioNel - autenticacion Hysteria v1 por HWID
-PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-LIST="@LIST@"
-h="$2"
-[ -n "$h" ] || exit 1
-[ "${#h}" -le 64 ] || exit 1
-case "$h" in *'|'*|*'\'*) exit 1;; esac
-[ "$(printf '%s' "$h" | wc -l)" -eq 0 ] || exit 1
-[ -r "$LIST" ] || exit 1
-exp="$(H="$h" awk -F'|' '$1==ENVIRON["H"]{print $2; exit}' "$LIST")"
-[ -n "$exp" ] || exit 1
-e="$(printf '%s' "$exp" | tr -d '-')"
-[ "$e" -ge "$(date +%Y%m%d)" ] 2>/dev/null || exit 1
-exit 0
-HV_AUTH_EOF
-  sed -i "s#@LIST@#$HV_HWIDS#" "$HV_AUTH"
-  chown root:root "$HV_AUTH" 2>/dev/null || true; chmod 755 "$HV_AUTH"
-}
-# Regenera la lista HWID|vencimiento a partir de users.db (se llama al crear/renovar/borrar usuarios)
-hv_sync_hwids(){
-  hv_installed || return 0
-  mkdir -p "$HV_DIR"
-  { db_all | awk -F'|' '$4=="hwid" && $1!="" {print $1 "|" $3}'; } > "$HV_HWIDS.tmp" 2>/dev/null || : > "$HV_HWIDS.tmp"
-  mv "$HV_HWIDS.tmp" "$HV_HWIDS"
-  chown "root:$HV_USER" "$HV_HWIDS" 2>/dev/null || true
-  chmod 640 "$HV_HWIDS"
-}
-hv_rand(){ head -c 48 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c "${1:-16}"; }
-hv_ssh_ports(){
-  local p=""
-  have sshd && p="$(sshd -T 2>/dev/null | awk '/^port /{print $2}' | sort -n -u | tr '\n' ' ')"
-  p="${p% }"; echo "${p:-22}"
-}
-hv_arch(){
-  case "$(uname -m)" in
-    x86_64|amd64) echo amd64;; aarch64|arm64) echo arm64;; armv7l|armv7) echo arm;; *) echo "";;
-  esac
-}
-hv_get_binary(){
-  local arch f base tmp hv_hash got
-  arch="$(hv_arch)"; [ -n "$arch" ] || { fail "Arquitectura no soportada: $(uname -m)"; return 1; }
-  # Binario local (para VPS que no llegan a GitHub): TIONEL_HV_BIN=/ruta/hysteria-linux-$arch
-  if [ -n "${TIONEL_HV_BIN:-}" ]; then
-    [ -f "$TIONEL_HV_BIN" ] || { fail "TIONEL_HV_BIN: no existe el archivo $TIONEL_HV_BIN"; return 1; }
-    [ "$(head -c 4 "$TIONEL_HV_BIN" 2>/dev/null | od -An -tx1 | tr -d ' \n')" = 7f454c46 ] \
-      || { fail "Ese archivo no es un binario ELF (puede ser una pagina HTML de error en vez del binario)."; return 1; }
-    warn "Se instala el binario LOCAL sin compararlo con hashes.txt. SHA256: $(sha256sum "$TIONEL_HV_BIN" | cut -d' ' -f1)"
-    mkdir -p "$HV_APPDIR"
-    install -m 755 "$TIONEL_HV_BIN" "$HV_BIN" && ok "Binario local instalado." && return 0
-    fail "No pude instalar el binario local."; return 1
-  fi
-  have curl || { have apt-get && DEBIAN_FRONTEND=noninteractive apt-get install -y curl >/dev/null 2>&1; }
-  have curl || { fail "Falta curl."; return 1; }
-  f="hysteria-linux-$arch"
-  base="https://github.com/apernet/hysteria/releases/download/$HV_VER"
-  tmp="$(mktemp -d)"
-  info "Descargando Hysteria $HV_VER ($arch) desde GitHub oficial..."
-  if ! curl -fsSL --retry 3 --connect-timeout 15 -o "$tmp/$f" "$base/$f" \
-     || ! curl -fsSL --retry 3 --connect-timeout 15 -o "$tmp/hashes.txt" "$base/hashes.txt"; then
-    rm -rf "$tmp"; fail "No pude descargar el binario o su lista de hashes (se usa solo GitHub oficial, sin espejos)."
-    info "Si tu VPS no llega a GitHub: baja el binario a mano y ejecuta  TIONEL_HV_BIN=/ruta/hysteria-linux-$arch $BRAND hysteria"
-    return 1
-  fi
-  hv_hash="$(awk -v n="$f" '{x=$2; sub(/^\*/,"",x); sub(/^.*\//,"",x); if (x==n) {print $1; exit}}' "$tmp/hashes.txt")"
-  got="$(sha256sum "$tmp/$f" | cut -d' ' -f1)"
-  if [ -z "$hv_hash" ] || [ "$hv_hash" != "$got" ]; then
-    rm -rf "$tmp"; fail "El hash SHA256 del binario no coincide (o no esta en hashes.txt). No se instala."; return 1
-  fi
-  mkdir -p "$HV_APPDIR"
-  install -m 755 "$tmp/$f" "$HV_BIN" && rm -rf "$tmp" && ok "Binario verificado (SHA256) e instalado."
-}
-hv_ensure_user(){
-  id "$HV_USER" >/dev/null 2>&1 && return 0
-  useradd -r -M -s /usr/sbin/nologin "$HV_USER" 2>/dev/null || useradd -r -M -s /sbin/nologin "$HV_USER" 2>/dev/null \
-    || { fail "No pude crear el usuario $HV_USER."; return 1; }
-}
-hv_ensure_tools(){
-  have openssl && have iptables && return 0
-  have apt-get || { fail "Faltan openssl/iptables y no hay apt-get."; return 1; }
-  DEBIAN_FRONTEND=noninteractive apt-get update -qq >/dev/null 2>&1 || true
-  DEBIAN_FRONTEND=noninteractive apt-get install -y openssl iptables >/dev/null 2>&1 || true
-  have openssl && have iptables || { fail "No pude instalar openssl/iptables."; return 1; }
-}
-hv_make_cert(){
-  local ip; ip="$(public_ip)"; ip="${ip:-127.0.0.1}"
-  mkdir -p "$HV_DIR"
-  [ -f "$HV_DIR/server.crt" ] && [ -f "$HV_DIR/server.key" ] && return 0
-  openssl req -x509 -nodes -newkey rsa:2048 -days 3650 -keyout "$HV_DIR/server.key" -out "$HV_DIR/server.crt" \
-    -subj "/CN=$ip" -addext "subjectAltName=IP:$ip" >/dev/null 2>&1 \
-    || openssl req -x509 -nodes -newkey rsa:2048 -days 3650 -keyout "$HV_DIR/server.key" -out "$HV_DIR/server.crt" -subj "/CN=$ip" >/dev/null 2>&1 \
-    || { fail "No pude generar el certificado."; return 1; }
-  chown "$HV_USER" "$HV_DIR/server.key" "$HV_DIR/server.crt" 2>/dev/null || true
-  chmod 600 "$HV_DIR/server.key"
-}
-hv_write_config(){
-  local port obfs auth up down authblock
-  port="$(hv_get PORT)"; obfs="$(hv_get OBFS)"; auth="$(hv_get AUTH)"; up="$(hv_get UP)"; down="$(hv_get DOWN)"
-  if [ "$(hv_authmode)" = hwid ]; then
-    authblock='"auth": { "mode": "external", "config": { "cmd": "'"$HV_AUTH"'" } },'
-  else
-    authblock='"auth": { "mode": "passwords", "config": ["'"$auth"'"] },'
-  fi
-  mkdir -p "$HV_DIR"
-  cat > "$HV_CONF" <<EOF
-{
-  "listen": ":$port",
-  "protocol": "udp",
-  "cert": "$HV_DIR/server.crt",
-  "key": "$HV_DIR/server.key",
-  "obfs": "$obfs",
-  $authblock
-  "up_mbps": ${up:-100},
-  "down_mbps": ${down:-100},
-  "recv_window_conn": 15728640,
-  "recv_window_client": 67108864,
-  "max_conn_client": 4096,
-  "disable_udp": true
-}
-EOF
-  chown "$HV_USER" "$HV_CONF" 2>/dev/null || true; chmod 600 "$HV_CONF"
-}
-# Restringe lo que el usuario del servicio puede abrir hacia afuera: solo el SSH local.
-hv_write_fw(){
-  local sp rg hport ex; sp="$(hv_get SSHPORTS)"; sp="${sp:-22}"
-  rg="$(hv_get RANGE)"; rg="${rg/-/:}"; hport="$(hv_get PORT)"; ex="$(hv_get EXTRA)"
-  mkdir -p "$(dirname "$HV_FW")"
-  cat > "$HV_FW" <<EOF
-#!/bin/sh
-# $BRAND Hysteria: el servicio solo puede conectar a 127.0.0.1 (SSH). Cualquier otro destino se rechaza.
-UID_HV="\$(id -u $HV_USER)" || exit 1
-PORTS="$(echo "$sp" | tr ' ' ',')"
-CH=TIONEL_HV
-NCH=TIONEL_HVN
-RANGE="$rg"
-EXTRA="$ex"
-HVPORT="$hport"
-apply(){
-  IPT="\$1"; LO="\$2"
-  command -v "\$IPT" >/dev/null 2>&1 || return 0
-  "\$IPT" -N \$CH 2>/dev/null || true
-  "\$IPT" -F \$CH || return 1
-  "\$IPT" -A \$CH -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT || return 1
-  "\$IPT" -A \$CH -o lo -p tcp -d "\$LO" -m multiport --dports "\$PORTS" -j ACCEPT || return 1
-  "\$IPT" -A \$CH -j REJECT || return 1
-  "\$IPT" -C OUTPUT -m owner --uid-owner "\$UID_HV" -j \$CH 2>/dev/null || "\$IPT" -I OUTPUT 1 -m owner --uid-owner "\$UID_HV" -j \$CH || return 1
-}
-remove(){
-  IPT="\$1"
-  command -v "\$IPT" >/dev/null 2>&1 || return 0
-  while "\$IPT" -D OUTPUT -m owner --uid-owner "\$UID_HV" -j \$CH 2>/dev/null; do :; done
-  "\$IPT" -F \$CH 2>/dev/null; "\$IPT" -X \$CH 2>/dev/null; return 0
-}
-# Salto de puertos + puertos extra: todo el UDP entrante del rango (y de los puertos extra,
-# ej. 443/53/123/4500) se redirige al puerto real de Hysteria.
-napply(){
-  IPT="\$1"
-  [ -n "\$RANGE\$EXTRA" ] || return 0
-  command -v "\$IPT" >/dev/null 2>&1 || return 0
-  "\$IPT" -t nat -N \$NCH 2>/dev/null || true
-  "\$IPT" -t nat -F \$NCH || return 1
-  if [ -n "\$RANGE" ]; then
-    "\$IPT" -t nat -A \$NCH -p udp --dport "\$RANGE" -j REDIRECT --to-ports "\$HVPORT" || return 1
-  fi
-  for X in \$EXTRA; do
-    "\$IPT" -t nat -A \$NCH -p udp --dport "\$X" -j REDIRECT --to-ports "\$HVPORT" || return 1
-  done
-  "\$IPT" -t nat -C PREROUTING -j \$NCH 2>/dev/null || "\$IPT" -t nat -I PREROUTING 1 -j \$NCH || return 1
-}
-nremove(){
-  IPT="\$1"
-  command -v "\$IPT" >/dev/null 2>&1 || return 0
-  while "\$IPT" -t nat -D PREROUTING -j \$NCH 2>/dev/null; do :; done
-  "\$IPT" -t nat -F \$NCH 2>/dev/null; "\$IPT" -t nat -X \$NCH 2>/dev/null; return 0
-}
-case "\$1" in
-  add)
-    apply iptables 127.0.0.1/8 || exit 1
-    command -v ip6tables >/dev/null 2>&1 && { apply ip6tables ::1/128 || true; }
-    nremove iptables; napply iptables || echo "aviso: no pude crear la redireccion NAT del rango de puertos (iptables)" >&2
-    nremove ip6tables; napply ip6tables >/dev/null 2>&1 || true
-    exit 0 ;;
-  del) remove iptables; remove ip6tables; nremove iptables; nremove ip6tables; exit 0 ;;
-  *) exit 2 ;;
-esac
-EOF
-  chmod 755 "$HV_FW"
-}
-hv_write_unit(){
-  mkdir -p "$(dirname "$HV_UNIT")"
-  cat > "$HV_UNIT" <<EOF
-[Unit]
-Description=$BRAND Hysteria v1 (transporte hacia SSH)
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-User=$HV_USER
-ExecStartPre=+$HV_FW add
-ExecStart=$HV_BIN server -c $HV_CONF
-ExecStopPost=+$HV_FW del
-AmbientCapabilities=CAP_NET_BIND_SERVICE
-NoNewPrivileges=true
-Restart=always
-RestartSec=3
-LimitNOFILE=1048576
-OOMScoreAdjust=-100
-
-[Install]
-WantedBy=multi-user.target
-EOF
-  systemctl daemon-reload >/dev/null 2>&1 || true
-}
-hv_open_port(){
-  if ufw_on; then ufw allow "$1/udp" >/dev/null 2>&1 && ok "UFW: abierto $1/udp"; fi
-  info "Recuerda abrir el puerto UDP $1 tambien en el panel de tu proveedor de VPS."
-}
-hv_close_port(){ ufw_on && ufw delete allow "$1/udp" >/dev/null 2>&1 || true; }
-hv_redirs(){ local r e; r="$(hv_get RANGE)"; e="$(hv_get EXTRA)"; printf '%s' "${r:+rango $r}${r:+${e:+ + }}${e:+puertos $e}"; }
-hv_apply(){      # regenera todo y reinicia
-  hv_set SSHPORTS "$(hv_ssh_ports)"      # si cambiaste el puerto de sshd, aqui se actualiza la regla de salida
-  hv_write_auth; hv_sync_hwids; hv_write_config; hv_write_fw; hv_write_unit
-  systemctl enable "$HV_UNIT_NAME" >/dev/null 2>&1 || true
-  systemctl restart "$HV_UNIT_NAME" >/dev/null 2>&1
-  sleep 2
-  if hv_active; then ok "Hysteria v1 activo en UDP :$(hv_get PORT)"
-    if [ -n "$(hv_get RANGE)$(hv_get EXTRA)" ]; then
-      if iptables -t nat -S TIONEL_HVN >/dev/null 2>&1; then ok "Redireccion UDP -> $(hv_get PORT): $(hv_redirs)"
-      else warn "No se pudo crear la redireccion de puertos (mira: journalctl -u $HV_UNIT_NAME)"; fi
-    fi
-  else fail "No arranco (mira: journalctl -u $HV_UNIT_NAME)"; return 1; fi
-}
-hv_install(){
-  need_root
-  local port obfs auth up down authmode am rg ex tn
-  have apt-get || warn "Sin apt-get: se intentara seguir, pero no esta probado."
-  hv_ensure_tools || return 1
-  hv_ensure_user || return 1
-  hv_get_binary || return 1
-  ask port " Puerto UDP [36712]: "; port="${port:-36712}"
-  valid_port "$port" || { fail "Puerto invalido."; return 1; }
-  if ss -lnu 2>/dev/null | awk -v p=":$port" '$4 ~ p"$" {f=1} END{exit !f}' && [ "$(hv_get PORT)" != "$port" ]; then
-    fail "El puerto UDP $port ya esta en uso."; return 1
-  fi
-  ask obfs " OBFS (Enter = generar uno aleatorio): "; obfs="${obfs:-$(hv_rand 16)}"
-  ask am " Autenticacion: [1] HWID (la app deja la contraseña vacia)  [2] Contraseña fija  [1]: "
-  if [ "${am:-1}" = 2 ]; then
-    authmode=password
-    ask auth " Contraseña Hysteria (Enter = aleatoria): "; auth="${auth:-$(hv_rand 20)}"
-  else
-    authmode=hwid; auth=""
-  fi
-  valid_secret "$obfs" || { fail "OBFS: solo letras, numeros . _ @ - (4 a 128)."; return 1; }
-  if [ "$authmode" = password ]; then valid_secret "$auth" || { fail "Contraseña: solo letras, numeros . _ @ - (4 a 128)."; return 1; }; fi
-  if [ "$obfs" = "crisdev" ] || [ "$auth" = "crisdev" ]; then fail "No uses 'crisdev': es publico."; return 1; fi
-  ask rg " Rango de puertos UDP para salto, ej. 20000-50000 (Enter = sin rango): "; rg="${rg// /}"
-  if [ -n "$rg" ]; then hv_check_range "$rg" "$port" || return 1; rg="$HV_RG"; fi
-  ask ex " Puertos UDP extra, ej. 443 53 123 4500 (Enter = ninguno): "
-  if [ -n "${ex// /}" ]; then hv_check_extra "$ex" "$port" || return 1; ex="$HV_EX"; else ex=""; fi
-  ask up " Subida Mbps de tu VPS [100]: "; up="${up:-100}"; ask down " Bajada Mbps de tu VPS [100]: "; down="${down:-100}"
-  [[ "$up" =~ ^[0-9]+$ ]] || up=100
-  [[ "$down" =~ ^[0-9]+$ ]] || down=100
-  hv_set PORT "$port"; hv_set OBFS "$obfs"; hv_set AUTH "$auth"; hv_set UP "$up"; hv_set DOWN "$down"
-  hv_set AUTHMODE "$authmode"; hv_set RANGE "$rg"; hv_set EXTRA "$ex"
-  hv_set SSHPORTS "$(hv_ssh_ports)"
-  hv_make_cert || return 1
-  hv_open_port "$port"
-  ask tn " Aplicar ajuste de red UDP (buffers del kernel a 64MB, se puede revertir)? [S/n]: "
-  case "$tn" in n|N) info "Sin ajuste de red (puedes activarlo despues desde este menu).";; *) hv_tuning_on;; esac
-  hv_apply || return 1
-  echo; hv_show
-}
-hv_show(){
-  hv_installed || { warn "Hysteria v1 no esta instalado."; return 0; }
-  echo " ---- Datos para la app ----"
-  printf ' %-16s %s\n' "Servidor:" "$(public_ip)"
-  printf ' %-16s %s\n' "Puerto UDP:" "$(hv_get PORT)"
-  printf ' %-16s %s\n' "OBFS:" "$(hv_get OBFS)"
-  if [ "$(hv_authmode)" = hwid ]; then
-    printf ' %-16s %s\n' "Autenticacion:" "HWID (dejar vacia la contraseña en la app)"
-  else
-    printf ' %-16s %s\n' "Autenticacion:" "Contraseña fija"
-    printf ' %-16s %s\n' "Contraseña:" "$(hv_get AUTH)"
-  fi
-  printf ' %-16s %s\n' "Rango de puertos:" "$(hv_get RANGE | sed 's/^$/(sin rango)/')"
-  printf ' %-16s %s\n' "Puertos extra:" "$(hv_get EXTRA | sed 's/^$/(ninguno)/')"
-  printf ' %-16s %s\n' "Up/Down Mbps:" "$(hv_get UP)/$(hv_get DOWN)"
-  printf ' %-16s %s\n' "Destino SSH:" "127.0.0.1:$(hv_get SSHPORTS | awk '{print $1}')"
-  echo
-  if [ "$(hv_authmode)" = hwid ]; then info "Solo entran los HWID creados en el panel (los mismos que usan para el SSH) y no vencidos."; fi
-  info "El login sigue siendo por SSH (usuarios HWID del panel). Hysteria solo lleva el tunel hasta el SSH local."
-  if [ -n "$(hv_get RANGE)" ]; then info "Abre tambien el rango UDP $(hv_get RANGE) en el firewall del proveedor del VPS."; fi
-  if [ -n "$(hv_get EXTRA)" ]; then info "Abre tambien UDP $(hv_get EXTRA) en el firewall del proveedor del VPS."; fi
-}
-hv_change_port(){
-  hv_installed || { warn "Instala primero."; return 0; }
-  local np old; old="$(hv_get PORT)"; ask np " Nuevo puerto UDP [$old]: "; np="${np:-$old}"
-  valid_port "$np" || { fail "Puerto invalido."; return 1; }
-  [ "$np" = "$old" ] && { info "Sin cambios."; return 0; }
-  if ss -lnu 2>/dev/null | awk -v p=":$np" '$4 ~ p"$" {f=1} END{exit !f}'; then fail "El puerto UDP $np ya esta en uso."; return 1; fi
-  hv_set PORT "$np"; hv_close_port "$old"; hv_open_port "$np"; hv_apply
-}
-hv_change_creds(){
-  hv_installed || { warn "Instala primero."; return 0; }
-  local o a; ask o " Nuevo OBFS (Enter = aleatorio): "; o="${o:-$(hv_rand 16)}"
-  valid_secret "$o" || { fail "Solo letras, numeros . _ @ - (4 a 128)."; return 1; }
-  if [ "$(hv_authmode)" = password ]; then
-    ask a " Nueva contraseña (Enter = aleatoria): "; a="${a:-$(hv_rand 20)}"
-    valid_secret "$a" || { fail "Solo letras, numeros . _ @ - (4 a 128)."; return 1; }
-    hv_set AUTH "$a"
-  fi
-  hv_set OBFS "$o"; hv_apply && { echo; hv_show; warn "Actualiza estos datos en la app de tus clientes."; }
-}
-hv_change_auth(){
-  hv_installed || { warn "Instala primero."; return 0; }
-  local am a cur; cur="$(hv_authmode)"
-  info "Autenticacion actual: $([ "$cur" = hwid ] && echo HWID || echo 'contraseña fija')"
-  ask am " [1] HWID (contraseña vacia en la app)  [2] Contraseña fija  (Enter = sin cambios): "
-  case "$am" in
-    1) hv_set AUTHMODE hwid;;
-    2) ask a " Contraseña (Enter = aleatoria): "; a="${a:-$(hv_rand 20)}"
-       valid_secret "$a" || { fail "Solo letras, numeros . _ @ - (4 a 128)."; return 1; }
-       if [ "$a" = "crisdev" ]; then fail "No uses 'crisdev': es publico."; return 1; fi
-       hv_set AUTHMODE password; hv_set AUTH "$a";;
-    *) info "Sin cambios."; return 0;;
-  esac
-  hv_apply && { echo; hv_show; warn "Actualiza estos datos en la app de tus clientes."; }
-}
-hv_change_range(){
-  hv_installed || { warn "Instala primero."; return 0; }
-  local rg; info "Rango actual: $(hv_get RANGE | sed 's/^$/ninguno/')"
-  ask rg " Nuevo rango UDP (ej. 20000-50000, 0 = quitar, Enter = sin cambios): "; rg="${rg// /}"
-  [ -n "$rg" ] || { info "Sin cambios."; return 0; }
-  if [ "$rg" = 0 ]; then hv_set RANGE ""
-  else hv_check_range "$rg" "$(hv_get PORT)" || return 1; hv_set RANGE "$HV_RG"; fi
-  hv_apply && { echo; hv_show; warn "Pon el mismo rango en el campo 'Puerto o rango' de la app."; }
-}
-# ---- puertos extra (443, 53, 123, 4500...): redirigen todo su UDP al puerto de Hysteria
-# Valida la lista y la deja normalizada en HV_EX
-hv_check_extra(){      # hv_check_extra "443 53" puerto_hysteria
-  local list="${1//,/ }" own="$2" p out="" c n=0
-  HV_EX=""
-  for p in $list; do
-    valid_port "$p" || { fail "Puerto invalido: $p"; return 1; }
-    p=$((10#$p))
-    if [ "$p" = "$own" ]; then warn "El puerto $p ya es el puerto de Hysteria: se omite."; continue; fi
-    case " $out " in *" $p "*) continue;; esac
-    c="$(hv_range_conflicts "$p" "$p" "$own")"
-    if [ -n "$c" ]; then fail "Ya hay un servicio UDP escuchando en el puerto $p (por ejemplo HTTP/3 en 443 o un DNS en 53). Elige otro."; return 1; fi
-    n=$((n + 1)); [ "$n" -le 8 ] || { fail "Maximo 8 puertos extra."; return 1; }
-    out="$out $p"
-  done
-  HV_EX="${out# }"
-}
-hv_change_extra(){
-  hv_installed || { warn "Instala primero."; return 0; }
-  local e; info "Puertos extra actuales: $(hv_get EXTRA | sed 's/^$/ninguno/')"
-  info "Sirven para que la app conecte por 443, 53, 123 o 4500 (puertos que algunas operadoras tratan mejor)."
-  info "Todo el UDP que llegue a esos puertos se redirige a Hysteria; el TCP (SSL/Nginx en 443, por ejemplo) no se toca."
-  ask e " Puertos UDP extra separados por espacio (0 = quitar, Enter = sin cambios): "
-  [ -n "${e// /}" ] || { info "Sin cambios."; return 0; }
-  if [ "${e// /}" = 0 ]; then hv_set EXTRA ""
-  else hv_check_extra "$e" "$(hv_get PORT)" || return 1; hv_set EXTRA "$HV_EX"; fi
-  hv_apply && { echo; hv_show; warn "Pon uno de esos puertos en el campo 'Puerto o rango' de la app."; }
-}
-
-# ---- ajuste de red UDP para QUIC (opcional y reversible; nunca BAJA un valor que ya es mayor)
-hv_tune_list(){
-cat <<'HV_TUNE_EOF'
-net.core.rmem_max|67108864
-net.core.wmem_max|67108864
-net.core.netdev_max_backlog|65536
-HV_TUNE_EOF
-}
-hv_tuning_state(){ [ -f "$HV_SYSCTL" ]; }
-hv_tuning_on(){
-  need_root; have sysctl || { fail "No encontre sysctl."; return 1; }
-  local k v cur
-  mkdir -p "$HV_DIR" "$(dirname "$HV_SYSCTL")"
-  [ -f "$HV_SYSPREV" ] || : > "$HV_SYSPREV"
-  printf '# %s Hysteria - buffers UDP/QUIC (se quita desde el panel: Protocolos > Hysteria v1)\n' "$BRAND" > "$HV_SYSCTL"
-  while IFS='|' read -r k v; do
-    [ -n "$k" ] || continue
-    cur="$(sysctl -n "$k" 2>/dev/null)" || continue
-    if [[ "$cur" =~ ^[0-9]+$ ]] && [ "$cur" -ge "$v" ]; then continue; fi
-    grep -q "^$k|" "$HV_SYSPREV" 2>/dev/null || printf '%s|%s\n' "$k" "$cur" >> "$HV_SYSPREV"
-    printf '%s = %s\n' "$k" "$v" >> "$HV_SYSCTL"
-    sysctl -w "$k=$v" >/dev/null 2>&1 || true
-  done < <(hv_tune_list)
-  ok "Ajuste de red UDP aplicado (rmem_max/wmem_max = $(sysctl -n net.core.rmem_max 2>/dev/null || echo '?'))."
-  info "Los valores anteriores quedaron guardados para poder revertirlo."
-}
-hv_tuning_off(){
-  need_root; local k v
-  if [ -s "$HV_SYSPREV" ]; then
-    while IFS='|' read -r k v; do [ -n "$k" ] && sysctl -w "$k=$v" >/dev/null 2>&1 || true; done < "$HV_SYSPREV"
-    ok "Valores anteriores restaurados."
-  fi
-  rm -f "$HV_SYSCTL" "$HV_SYSPREV"
-  # si el ajuste BBR/BHTTP sigue activo, se vuelven a aplicar sus valores (no debe perderlos)
-  [ -f "$BH_TUNE" ] && sysctl -p "$BH_TUNE" >/dev/null 2>&1 || true
-  ok "Ajuste de red UDP quitado."
-}
-
-# ---- diagnostico completo de Hysteria v1 (equivalente al check_udp.sh de CRIS, adaptado a este panel)
-hv_diag(){
-  hv_installed || { warn "Hysteria v1 no esta instalado."; return 0; }
-  local port rg ex sp sp1 cur n exp up down obfs u ver
-  DG_W=0; DG_F=0
-  d_ok(){ ok "$*"; }
-  d_warn(){ warn "$*"; DG_W=$((DG_W + 1)); }
-  d_fail(){ fail "$*"; DG_F=$((DG_F + 1)); }
-  port="$(hv_get PORT)"; rg="$(hv_get RANGE)"; ex="$(hv_get EXTRA)"; sp="$(hv_get SSHPORTS)"; sp1="$(echo "${sp:-22}" | awk '{print $1}')"
-  ver="$(timeout 3 "$HV_BIN" -v 2>/dev/null | head -1)"
-  echo "===== Diagnostico Hysteria v1 ====="; [ -n "$ver" ] && info "Binario: $ver"
-
-  echo; echo "1. Servicio"
-  if hv_active; then d_ok "ACTIVO ($HV_UNIT_NAME)"; else d_fail "INACTIVO: usa REINICIAR (opcion 7) y mira los logs (opcion 9)"; fi
-  if systemctl is-enabled --quiet "$HV_UNIT_NAME" 2>/dev/null; then d_ok "Arranca solo al encender el VPS"; else d_warn "No esta habilitado para arrancar solo: usa REINICIAR (opcion 7)"; fi
-  if grep -q '^Restart=always' "$HV_UNIT" 2>/dev/null; then d_ok "Restart=always (se recupera si se cae)"; else d_warn "Sin Restart=always: usa REINICIAR (opcion 7) para regenerar la unidad"; fi
-  if grep -q '^OOMScoreAdjust=' "$HV_UNIT" 2>/dev/null; then d_ok "Proteccion OOM activa (el sistema lo mata al final si falta RAM)"; else d_warn "Sin OOMScoreAdjust: usa REINICIAR (opcion 7) para regenerar la unidad"; fi
-
-  echo; echo "2. Puerto UDP"
-  if ss -lnu 2>/dev/null | awk -v p=":$port" '$4 ~ p"$" {f=1} END{exit !f}'; then d_ok "Escuchando en UDP :$port"
-  else d_fail "Nada escucha en UDP :$port (servicio caido o puerto ocupado)"; fi
-
-  echo; echo "3. Configuracion"
-  if [ -f "$HV_CONF" ]; then
-    up="$(hv_get UP)"; down="$(hv_get DOWN)"
-    if [[ "$up" =~ ^[0-9]+$ ]] && [ "$up" -gt 0 ] && [[ "$down" =~ ^[0-9]+$ ]] && [ "$down" -gt 0 ]; then d_ok "Up/Down declarados: $up/$down Mbps (deben ser los reales de tu VPS)"
-    else d_fail "up/down Mbps invalidos en la configuracion"; fi
-    obfs="$(hv_get OBFS)"
-    if [ -n "$obfs" ]; then d_ok "OBFS configurado"; else d_warn "Sin OBFS: el trafico se identifica mas facil como QUIC"; fi
-    grep -q '"recv_window_conn"' "$HV_CONF" && grep -q '"recv_window_client"' "$HV_CONF" && d_ok "Ventanas QUIC (recv_window_conn / recv_window_client) presentes" || d_warn "Faltan las ventanas QUIC en config.json"
-    grep -q '"disable_udp": true' "$HV_CONF" && d_ok "disable_udp=true (solo lleva TCP hacia el SSH, no es proxy abierto)" || d_warn "disable_udp no esta en true"
-    if [ "$(hv_authmode)" = hwid ]; then
-      if [ -x "$HV_AUTH" ]; then d_ok "Autenticacion por HWID: auth.sh presente"; else d_fail "Falta auth.sh (modo HWID): usa REINICIAR (opcion 7)"; fi
-      if [ -r "$HV_HWIDS" ]; then
-        n="$(grep -c . "$HV_HWIDS" 2>/dev/null || true)"; [[ "$n" =~ ^[0-9]+$ ]] || n=0
-        if [ "$n" -gt 0 ]; then d_ok "$n HWID autorizado(s)"; else d_warn "0 HWID autorizados: nadie podra conectar hasta crear usuarios HWID"; fi
-        if have runuser && id "$HV_USER" >/dev/null 2>&1; then
-          runuser -u "$HV_USER" -- test -r "$HV_HWIDS" 2>/dev/null
-          [ $? -ne 1 ] || d_fail "El usuario $HV_USER no puede leer la lista de HWID: usa REINICIAR (opcion 7)"
-        fi
-      else d_fail "No existe la lista de HWID: usa REINICIAR (opcion 7)"; fi
-    else
-      [ -n "$(hv_get AUTH)" ] && d_ok "Autenticacion por contraseña fija" || d_fail "Contraseña vacia en modo contraseña"
-    fi
-  else d_fail "No existe $HV_CONF: usa REINICIAR (opcion 7)"; fi
-
-  echo; echo "4. Certificado"
-  if [ -f "$HV_DIR/server.crt" ] && [ -f "$HV_DIR/server.key" ]; then
-    exp="$(openssl x509 -enddate -noout -in "$HV_DIR/server.crt" 2>/dev/null | cut -d= -f2)"
-    if ! openssl x509 -checkend 0 -noout -in "$HV_DIR/server.crt" >/dev/null 2>&1; then d_fail "Certificado VENCIDO ($exp): borra $HV_DIR/server.* y reinstala"
-    elif ! openssl x509 -checkend 2592000 -noout -in "$HV_DIR/server.crt" >/dev/null 2>&1; then d_warn "El certificado vence en menos de 30 dias ($exp)"
-    else d_ok "Certificado valido hasta: $exp"; fi
-  else d_fail "Faltan server.crt / server.key en $HV_DIR"; fi
-
-  echo; echo "5. Destino SSH (lo unico a lo que Hysteria puede llegar)"
-  if listening "$sp1"; then d_ok "sshd escucha en el puerto $sp1"; else d_fail "Nada escucha en TCP :$sp1: el tunel no tendria a donde llegar"; fi
-  cur="$(hv_ssh_ports)"
-  if [ "$cur" = "${sp:-22}" ]; then d_ok "Puertos SSH permitidos por el firewall del servicio: $cur"
-  else d_warn "sshd usa ahora el/los puerto(s) '$cur' pero la regla de salida permite '${sp:-22}': usa REINICIAR (opcion 7) para actualizarla"; fi
-
-  echo; echo "6. Firewall y redireccion de puertos"
-  if hv_active; then
-    if iptables -S TIONEL_HV >/dev/null 2>&1; then d_ok "Restriccion de salida activa (el servicio solo puede llegar al SSH local)"
-    else d_fail "Falta la cadena TIONEL_HV: el servicio podria conectar a cualquier destino. Usa REINICIAR (opcion 7)"; fi
-    if [ -n "$rg$ex" ]; then
-      if iptables -t nat -S TIONEL_HVN >/dev/null 2>&1; then
-        [ -z "$rg" ] || { iptables -t nat -S TIONEL_HVN 2>/dev/null | grep -q -- "--dport ${rg/-/:} " && d_ok "Salto de puertos activo: UDP $rg -> $port" || d_warn "No encuentro la regla del rango $rg"; }
-        for n in $ex; do iptables -t nat -S TIONEL_HVN 2>/dev/null | grep -q -- "--dport $n " && d_ok "Puerto extra UDP $n -> $port" || d_warn "No encuentro la regla del puerto extra $n"; done
-      else d_fail "Faltan las reglas NAT de redireccion (rango/puertos extra): usa REINICIAR (opcion 7)"; fi
-    else info "Sin rango ni puertos extra configurados (solo el puerto $port)."; fi
-  else info "Servicio detenido: las reglas se crean al arrancar."; fi
-  if ufw_on; then
-    if ufw status 2>/dev/null | grep -Eq "^$port/udp[[:space:]]+ALLOW"; then d_ok "UFW permite $port/udp"; else d_warn "UFW activo pero sin regla para $port/udp: ufw allow $port/udp"; fi
-  else info "UFW inactivo (no se comprueba)."; fi
-  info "Recuerda: el puerto${rg:+, el rango}${ex:+ y los puertos extra} UDP tambien deben estar abiertos en el firewall del proveedor del VPS."
-
-  echo; echo "7. Kernel (buffers UDP)"
-  cur="$(sysctl -n net.core.rmem_max 2>/dev/null || echo 0)"
-  if [[ "$cur" =~ ^[0-9]+$ ]] && [ "$cur" -ge 67108864 ]; then d_ok "rmem_max=$cur (>= 64MB)"
-  else d_warn "rmem_max=$cur: bajo para QUIC con ventanas de 64MB. Activa 'AJUSTE DE RED UDP' (opcion 12)"; fi
-
-  echo; echo "8. Ultimos logs"
-  journalctl -u "$HV_UNIT_NAME" -n 8 --no-pager 2>/dev/null || info "Sin logs."
-
-  echo
-  if [ "$DG_F" -eq 0 ] && [ "$DG_W" -eq 0 ]; then ok "Todo en orden."
-  else warn "Resultado: $DG_F error(es), $DG_W advertencia(s)."; fi
-  unset -f d_ok d_warn d_fail
-}
-hv_uninstall(){
-  need_root; hv_installed || { info "No esta instalado."; return 0; }
-  confirm_word BORRAR "Se quitara Hysteria v1 de este panel." || { info "Sin cambios."; return 0; }
-  hv_close_port "$(hv_get PORT)"
-  hv_tuning_state && hv_tuning_off
-  systemctl disable --now "$HV_UNIT_NAME" >/dev/null 2>&1 || true
-  [ -x "$HV_FW" ] && "$HV_FW" del >/dev/null 2>&1 || true
-  rm -f "$HV_UNIT" "$HV_FW"; rm -rf "$HV_DIR" "$HV_APPDIR"
-  id "$HV_USER" >/dev/null 2>&1 && userdel "$HV_USER" >/dev/null 2>&1 || true
-  systemctl daemon-reload >/dev/null 2>&1 || true
-  ok "Hysteria v1 desinstalado."
-}
-hv_menu(){
-  need_root; local op r e st
-  while true; do
-    clear 2>/dev/null || true; calc_w
-    title "ADMINISTRADOR HYSTERIA v1 (SSH)"
-    if hv_installed; then
-      printf ' %bUDP :%b %s   ' "$GY" "$WH" "$(hv_get PORT)"; hv_active && tag on || tag off; echo
-      r="$(hv_get RANGE)"; e="$(hv_get EXTRA)"
-      printf ' %bAuth:%b %s   %bRango:%b %s\n' "$GY" "$WH" "$([ "$(hv_authmode)" = hwid ] && echo HWID || echo CLAVE)" "$GY" "$WH" "${r:--}"
-      [ -z "$e" ] || printf ' %bExtra:%b %s\n' "$GY" "$WH" "$e"
-    else printf ' %bHysteria v1 sin instalar%b\n' "$GY" "$C_O"; fi
-    dash
-    item 1 "INSTALAR / REINSTALAR"
-    item 2 "VER DATOS PARA LA APP"
-    item 3 "CAMBIAR PUERTO"
-    item 4 "CAMBIAR OBFS / CONTRASEÑA"
-    item 5 "AUTENTICACION (HWID / CONTRASEÑA)"
-    item 6 "RANGO DE PUERTOS (SALTO)"
-    item 7 "REINICIAR"
-    item 8 "DETENER"
-    item 9 "VER LOGS"
-    dash
-    item 10 "DIAGNOSTICO COMPLETO"
-    item 11 "PUERTOS EXTRA (443, 53, 123...)"
-    hv_tuning_state && st=on || st=off; pitem 12 "AJUSTE DE RED UDP" "$st"
-    item 13 "[!] DESINSTALAR" "$OR"
-    hl; printf ' %b[0]%b %b Volver %b\n' "$GY" "$C_O" "$BGR" "$C_O"; hl
-    ask_op op
-    case "$op" in
-      1) hv_install; pause;;
-      2) hv_show; pause;;
-      3) hv_change_port; pause;;
-      4) hv_change_creds; pause;;
-      5) hv_change_auth; pause;;
-      6) hv_change_range; pause;;
-      7) if hv_installed; then hv_apply; else warn "No esta instalado."; fi; pause;;
-      8) systemctl stop "$HV_UNIT_NAME" 2>/dev/null; warn "Detenido (vuelve a arrancar con Reiniciar)."; pause;;
-      9) journalctl -u "$HV_UNIT_NAME" -n 50 --no-pager 2>/dev/null || info "Sin logs."; pause;;
-      10) hv_diag; pause;;
-      11) hv_change_extra; pause;;
-      12) if hv_tuning_state; then hv_tuning_off; else hv_tuning_on; fi; pause;;
-      13) hv_uninstall; pause;;
-      0) return 0;;
-      *) echo " Opcion invalida"; sleep 1;;
-    esac
-  done
-}
-
-# =====================================================================
 #  USUARIOS HWID / SSH  (cuentas del sistema con fecha de vencimiento)
 #  HWID: el HWID del dispositivo se usa como clave de la cuenta.
 #  Solo se tocan usuarios creados desde este panel (users.db).
@@ -3506,9 +3259,9 @@ hv_menu(){
 db_all(){ [ -f "$USR_DB" ] && grep -E '^[^|#]+\|' "$USR_DB" || true; }
 db_row(){ [ -f "$USR_DB" ] && awk -F'|' -v u="$1" '$1==u' "$USR_DB" | head -1 || true; }
 db_field(){ db_row "$1" | cut -d'|' -f"$2"; }
-db_del(){ [ -f "$USR_DB" ] || return 0; awk -F'|' -v u="$1" '$1!=u' "$USR_DB" > "$USR_DB.tmp"; mv "$USR_DB.tmp" "$USR_DB"; chmod 600 "$USR_DB"; hv_sync_hwids; }
+db_del(){ [ -f "$USR_DB" ] || return 0; awk -F'|' -v u="$1" '$1!=u' "$USR_DB" > "$USR_DB.tmp"; mv "$USR_DB.tmp" "$USR_DB"; chmod 600 "$USR_DB"; }
 db_put(){ mkdir -p "$(dirname "$USR_DB")"; [ -f "$USR_DB" ] || : > "$USR_DB"; db_del "$1"
-  printf '%s|%s|%s|%s\n' "$1" "$2" "$3" "$4" >> "$USR_DB"; chmod 600 "$USR_DB"; hv_sync_hwids; }
+  printf '%s|%s|%s|%s\n' "$1" "$2" "$3" "$4" >> "$USR_DB"; chmod 600 "$USR_DB"; }
 days_left(){ local e t; e="$(date -u -d "$1" +%s 2>/dev/null)" || { echo -9999; return; }
   t="$(date -u -d "$(date +%F)" +%s)"; echo $(( (e - t) / 86400 )); }
 user_locked(){ passwd -S "$1" 2>/dev/null | awk '{print $2}' | grep -q '^L'; }
@@ -3599,7 +3352,7 @@ u_list(){
 u_monitor(){
   local u c tot=0
   while IFS='|' read -r u _; do
-    [ -n "$u" ] || continue; c="$(pgrep -c -u "$u" -f 'sshd|dropbear' 2>/dev/null || true)"; [[ "$c" =~ ^[0-9]+$ ]] || c=0
+    [ -n "$u" ] || continue; c="$(pgrep -c -u "$u" -f 'sshd|dropbear' 2>/dev/null || echo 0)"; c="${c:-0}"
     tot=$((tot + c))
     if [ "$c" -gt 0 ]; then printf ' %b%-16s%b %b%s conexion(es)%b\n' "$WH" "$u" "$C_O" "$GN" "$c" "$C_O"; fi
   done < <(db_all)
@@ -3710,6 +3463,7 @@ users_menu(){
 #  Acciones existentes (BHTTP, V2Ray, Hysteria, herramientas)
 # =====================================================================
 open_bhttp(){ write_subs; if bh_installed; then "$BH_MGR" menu; else "$BH_MGR" install; pause; fi; }
+open_hcr(){ write_subs; "$HCR_MGR" menu; }
 open_xray(){ write_subs; if xr_installed; then "$XR_MGR" menu; else "$XR_MGR" install; pause; fi; }
 hysteria_info(){
   echo "===== Hysteria2 ====="
@@ -3721,8 +3475,6 @@ hysteria_info(){
 toggle_bbr(){
   write_subs
   if [ -f "$BH_TUNE" ]; then "$BH_MGR" tuning-off; else "$BH_MGR" tuning-on; fi
-  # el ajuste BBR puede haber bajado los buffers UDP: se vuelven a aplicar los de Hysteria
-  [ -f "$HV_SYSCTL" ] && sysctl -p "$HV_SYSCTL" >/dev/null 2>&1 || true
 }
 firewall_view(){
   echo "===== Firewall ====="
@@ -3730,7 +3482,7 @@ firewall_view(){
 }
 conns_view(){
   echo "===== Conexiones activas ahora ====="
-  local p any=0 hn hnm
+  local p any=0
   show(){
     local label="$1" port="$2" n ips
     n="$(conn_count "$port")"
@@ -3740,46 +3492,39 @@ conns_view(){
     any=1
   }
   for p in $(bh_ports); do show "BHTTP" "$p"; done
+  for p in $(hr_ports); do show "HCR" "$p"; done
   xr_installed && show "V2Ray" "$(xr_port)"
-  if hv_installed; then
-    hnm="${BRAND}-hysteria"; hnm="${hnm:0:15}"      # el kernel recorta el nombre del proceso a 15 letras
-    hn="$(ss -tnp 2>/dev/null | awk -v nm="$hnm" '$1=="ESTAB" && index($0, nm) {c++} END{print c+0}')"
-    printf 'HYSTERIA v1 :%s  ->  %s sesion(es) SSH tuneladas ahora\n' "$(hv_get PORT)" "$hn"
-    any=1
-  fi
   [ "$any" -eq 1 ] || info "No hay servicios instalados."
   echo; info "Con BHTTP cada usuario abre muchas conexiones cortas: mira el numero de IPs, no el de conexiones."
 }
 restart_services(){
   write_subs; local did=0 p
   if bh_installed; then "$BH_MGR" restart; did=1; fi
+  if hr_installed; then "$HCR_MGR" restart; did=1; fi
   if xr_installed; then systemctl restart "${BRAND}-xray.service" && ok "V2Ray reiniciado."; did=1; fi
   if ug_installed; then for p in $(ug_ports); do systemctl restart "$(ug_unit "$p")"; done; ok "BADVPN-UDPGW reiniciado."; did=1; fi
-  if hv_installed; then hv_apply; did=1; fi
   [ "$did" -eq 1 ] || info "No hay servicios instalados."
 }
 reboot_server(){ confirm_word REINICIAR "Se reiniciara TODO el servidor y se cortaran las conexiones." || { info "Sin cambios."; return 0; }; info "Reiniciando..."; sleep 1; reboot; }
 logs_menu(){
-  local o p; echo "1) BHTTP   2) V2Ray   3) BADVPN-UDPGW   4) HYSTERIA v1"; ask o "Cual: "
+  local o p; echo "1) BHTTP   2) V2Ray   3) BADVPN-UDPGW   4) HCR"; ask o "Cual: "
   case "$o" in
     1) write_subs; "$BH_MGR" logs;;
     2) journalctl -u "${BRAND}-xray.service" -n 80 --no-pager 2>/dev/null || info "Sin logs.";;
-    4) journalctl -u "$HV_UNIT_NAME" -n 80 --no-pager 2>/dev/null || info "Sin logs.";;
+    4) write_subs; p="$(hr_ports | awk '{print $1}')"; [ -n "$p" ] && "$HCR_MGR" logs "$p" || info "HCR sin puertos.";;
     3) p="$(ug_ports | awk '{print $1}')"; [ -n "$p" ] && { journalctl -u "$(ug_unit "$p")" -n 80 --no-pager 2>/dev/null || info "Sin logs."; } || info "BADVPN-UDPGW sin instalar.";;
   esac
 }
 uninstall_all(){
   need_root; write_subs
-  warn "Esto desinstala BHTTP, V2Ray, BADVPN-UDPGW, Hysteria v1 y este panel. No toca tu SSH, Hysteria2 ni las cuentas de usuario ya creadas."
+  warn "Esto desinstala BHTTP, V2Ray, HCR, BADVPN-UDPGW y este panel. No toca tu SSH, Hysteria2 ni las cuentas de usuario ya creadas."
   confirm_word TODO "Desinstalar todo." || { info "Sin cambios."; return 0; }
   bh_installed && BHTTP_YES=1 "$BH_MGR" uninstall
   [ -f "$BH_TUNE" ] && BHTTP_YES=1 "$BH_MGR" tuning-off
   xr_installed && XRAY_YES=1 "$XR_MGR" uninstall
+  hr_installed && HCR_YES=1 "$HCR_MGR" uninstall
   if ug_installed; then TIONEL_YES=1 ug_uninstall; fi
-  if hv_installed; then TIONEL_YES=1 hv_uninstall; fi
-  autostart_off                      # si no, cada login por SSH daria "command not found"
-  clean_disable; rm -f "$CLEAN_CONF" # cron del limpiador automatico
-  rm -f "$CRON_FILE" "$BH_MGR" "$BH_LINK" "$XR_MGR" "$XR_LINK" "$PANEL_LINK" "$PANEL_DEST"
+  rm -f "$CRON_FILE" "$BH_MGR" "$BH_LINK" "$XR_MGR" "$XR_LINK" "$HCR_MGR" "$HCR_LINK" "$PANEL_LINK" "$PANEL_DEST"
   ok "$BRAND desinstalado por completo."; exit 0
 }
 
@@ -3793,6 +3538,7 @@ protocols_menu(){
     title "ADMINISTRADOR DE PROTOCOLOS"
     printf ' %bBADVPN:%b %-14s %bBHTTP:%b %s\n' "$OR" "$GY" "$(ug_ports || true)" "$OR" "$GY" "$(bh_ports || true)"
     printf ' %bV2RAY :%b %-14s %bHY2  :%b %s\n' "$OR" "$GY" "$(xr_installed && xr_port || true)" "$OR" "$GY" "$(hy_active && hy_port || true)"
+    printf ' %bHCR   :%b %s\n' "$OR" "$GY" "$(hr_ports || true)"
     dash
     if bh_installed; then bh_active && st=on || st=off; ps="$(bh_ports)"; pitem 1 "BHTTP" "$st" "${ps:+:${ps// /,:}}$(bh_tls && printf ' TLS')"
     else pitem 1 "BHTTP" none "(sin instalar)"; fi
@@ -3800,13 +3546,13 @@ protocols_menu(){
     else pitem 2 "V2RAY/XRAY REALITY" none "(sin instalar)"; fi
     if ug_installed; then ug_active && st=on || st=off; pitem 3 "BADVPN-UDPGW" "$st" "$(ug_ports)"
     else pitem 3 "BADVPN-UDPGW" none "(sin instalar)"; fi
-    if hv_installed; then hv_active && st=on || st=off; pitem 4 "HYSTERIA v1 (SSH)" "$st" "udp :$(hv_get PORT)"
-    else pitem 4 "HYSTERIA v1 (SSH)" none "(sin instalar)"; fi
-    if hy_active; then pitem 5 "HYSTERIA2" on "udp :$(hy_port)"; else pitem 5 "HYSTERIA2" none "(no detectado)"; fi
+    if hy_active; then pitem 4 "HYSTERIA2" on "udp :$(hy_port)"; else pitem 4 "HYSTERIA2" none "(no detectado)"; fi
+    if hr_installed; then hr_active && st=on || st=off; ps="$(hr_ports)"; pitem 5 "HCR (turbo)" "$st" "${ps:+:${ps// /,:}}"
+    else pitem 5 "HCR (turbo)" none "(sin instalar)"; fi
     hl; printf ' %b[0]%b %b Volver %b\n' "$GY" "$C_O" "$BGR" "$C_O"; hl
     ask_op op
     case "$op" in
-      1) open_bhttp;; 2) open_xray;; 3) ug_menu;; 4) hv_menu;; 5) hysteria_info; pause;;
+      1) open_bhttp;; 2) open_xray;; 3) ug_menu;; 4) hysteria_info; pause;; 5) open_hcr;;
       0) return 0;; *) echo " Opcion invalida"; sleep 1;;
     esac
   done
@@ -3883,12 +3629,11 @@ $BRAND - panel de VPS v$PANEL_VERSION
   $BRAND status         muestra el estado y sale
   $BRAND users          menu de usuarios HWID/SSH
   $BRAND udpgw          menu de BADVPN-UDPGW
-  $BRAND hysteria       menu de Hysteria v1 (transporte hacia SSH)
-  $BRAND hysteria-check diagnostico completo de Hysteria v1 (servicio, puertos, firewall, certificado, kernel)
   $BRAND expire         borra los usuarios vencidos (lo usa el cron diario)
   $BRAND cleanup        limpia RAM/cache y logs viejos (lo usa el cron del limpiador)
   $BRAND bhttp ...      atajo a $BRAND-bhttp (ej: $BRAND bhttp add-port 8081)
   $BRAND xray ...       atajo a $BRAND-xray  (ej: $BRAND xray links)
+  $BRAND hcr ...        atajo a $BRAND-hcr   (ej: $BRAND hcr add-port 8080 | optimize)
 EOF
 }
 
@@ -3901,12 +3646,11 @@ main(){
     status) PANEL_IP="$(public_ip)"; draw;;
     users) need_root; PANEL_IP="$(public_ip)"; users_menu;;
     udpgw) need_root; ug_menu;;
-    hysteria) need_root; PANEL_IP="$(public_ip)"; hv_menu;;
-    hysteria-check|diag) need_root; hv_diag;;
     expire) need_root; u_expired;;
     cleanup) need_root; do_cleanup;;
     bhttp) need_root; write_subs; "$BH_MGR" "$@";;
     xray) need_root; write_subs; "$XR_MGR" "$@";;
+    hcr) need_root; write_subs; "$HCR_MGR" "$@";;
     uninstall) uninstall_all;;
     help|-h|--help) usage;;
     *) usage; exit 2;;
