@@ -2686,7 +2686,7 @@ set -u
 BRAND="el_tioNel"
 NAME="${BRAND}-hcr"
 CMD="$NAME"
-MANAGER_VERSION="1.0"
+MANAGER_VERSION="1.3"
 ROOT="${HCR_ROOT:-}"                             # solo para pruebas; en uso normal queda vacio
 
 # Mismas rutas y servicios que el script hcr original: tus puertos actuales se reconocen solos.
@@ -2777,7 +2777,7 @@ reconcile_ports(){
 
 # ---------------------------------------------------------------- servicio (sin los limites que frenaban la velocidad)
 write_unit(){          # write_unit PUERTO TRANSPORTE TARGET FRAME POLL
-  local port="$1" transport="$2" target="$3" frame="$4" poll="$5" tls=""
+  local port="$1" transport="$2" target="$3" frame="$4" poll="$5" tls="" lim; lim="$(limit_flags)"
   if [ "$transport" = tls ] || [ "$transport" = auto ]; then
     if [ -f "$INSTALL_DIR/fullchain.pem" ] && [ -f "$INSTALL_DIR/privkey.pem" ]; then
       tls=" --tls-cert $INSTALL_DIR/fullchain.pem --tls-key $INSTALL_DIR/privkey.pem"
@@ -2797,7 +2797,7 @@ Type=exec
 User=root
 Group=root
 WorkingDirectory=$INSTALL_DIR
-ExecStart=$BINARY_PATH --listen :$port --target $target --transport $transport$tls --max-download-frame $frame --download-poll-timeout ${poll}s
+ExecStart=$BINARY_PATH --listen :$port --target $target --transport $transport$tls --max-download-frame $frame --download-poll-timeout ${poll}s${lim}
 Restart=always
 RestartSec=2s
 TimeoutStopSec=15s
@@ -2851,6 +2851,7 @@ download_binary(){
   if curl -fsSL -L -o "$tmp" "$BINARY_URL"; then
     chmod +x "$tmp"
     if "$tmp" -version 2>/dev/null | grep -q "hcr-server version"; then
+      [ -x "$BINARY_PATH" ] && cp -f "$BINARY_PATH" "$BINARY_PATH.prev" 2>/dev/null     # guarda la version actual para poder volver (opcion 18)
       mv -f "$tmp" "$BINARY_PATH"; chown root:root "$BINARY_PATH"; chmod 755 "$BINARY_PATH"
       ok "Binario instalado/actualizado."; "$BINARY_PATH" -version 2>/dev/null || true
     else rm -f "$tmp"; fail "El archivo descargado no es un binario hcr-server valido."; return 1; fi
@@ -2874,13 +2875,15 @@ tuning_off(){ [ -x "$BH_MGR" ] || return 0; "$BH_MGR" tuning-off; }
 # ---------------------------------------------------------------- acciones
 ask_profile(){        # deja en P_TRANSPORT P_TARGET P_FRAME P_POLL
   P_TRANSPORT="$DEFAULT_TRANSPORT"; P_TARGET="$DEFAULT_TARGET"
-  echo; item 1 "TURBO  (frame $TURBO_FRAME, poll ${TURBO_POLL}s)  <- recomendado"; item 2 "Rapido (frame 2000, poll 4s)"
-  item 3 "Estable (frame 6000, poll 6s)"; item 4 "Personalizar"; item 0 "Volver"
+  echo; item 1 "TURBO  (frame $TURBO_FRAME, poll ${TURBO_POLL}s)  <- recomendado"; item 2 "Rapido (frame 2000, poll 4s) *"
+  item 3 "Estable (frame 6000, poll 6s) *"; item 4 "Personalizar"; item 5 "ANTI-CORTES (frame 4000, poll 2s)"; item 0 "Volver"
+  info "* La app espera 4,5 s por cada consulta larga: con un poll de 4 s hay poco margen y con 6 s siempre hay timeouts. Si hay cortes, baja el FRAME y deja el poll en 2 s (ANTI-CORTES)."
   local o; ask_op o
   case "$o" in
     1) P_FRAME=$TURBO_FRAME; P_POLL=$TURBO_POLL;;
     2) P_FRAME=2000; P_POLL=4;;
     3) P_FRAME=6000; P_POLL=6;;
+    5) P_FRAME=4000; P_POLL=2;;
     4) ask P_TRANSPORT "Transport plain/tls/auto [plain]: "; P_TRANSPORT="${P_TRANSPORT:-plain}"
        case "$P_TRANSPORT" in plain|tls|auto) ;; *) fail "Transport no admitido."; return 1;; esac
        ask P_TARGET "Target SSH [$DEFAULT_TARGET]: "; P_TARGET="${P_TARGET:-$DEFAULT_TARGET}"
@@ -2959,6 +2962,7 @@ status(){
     printf ' :%-6s %-4s transport=%s target=%s frame=%s poll=%ss\n' "$p" "$(port_active "$p" && echo ON || echo OFF)" "$t" "$tg" "$fr" "$po"; done
   [ "$any" -eq 1 ] || info "Sin puertos configurados."
   echo "Ajuste de red: $(tuning_state) | congestion TCP: $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo '?')"
+  echo "Limites: sesiones $(lim_show MAX_SESSIONS '32 (defecto)') | por IP $(lim_show MAX_PER_IP 'auto') | conexiones $(lim_show MAX_CONNS '2048 (defecto)') | estadisticas $(stats_show)"
   if [ "$any" -eq 1 ]; then
     local lim; lim="$(systemctl show "$(svc "$(ports_list | head -1)")" -p LimitNOFILE --value 2>/dev/null)"
     echo "Limite de archivos (1er puerto): ${lim:-?}"
@@ -2971,6 +2975,269 @@ do_uninstall(){
   ok "HCR desinstalado (el ajuste de red se quita desde el menu de BHTTP/Herramientas)."
 }
 
+# ---------------------------------------------------------------- conexiones y utilidades (v1.1)
+conn_count(){ ss -tan 2>/dev/null | awk -v p=":$1" '$1=="ESTAB" && $4 ~ p"$" {n++} END{print n+0}'; }
+total_conns(){ local p n=0 c; for p in $(ports_list); do c="$(conn_count "$p")"; n=$((n + c)); done; echo "$n"; }
+valid_target(){ local t="${1:-}" h pt; [[ "$t" == *:* ]] || return 1; h="${t%:*}"; pt="${t##*:}"; [[ "$h" =~ ^[A-Za-z0-9._-]+$ ]] && valid_port "$pt"; }
+ssh_banner(){          # ssh_banner HOST PUERTO  -> 0 si el destino contesta con un saludo SSH
+  local b; b="$(timeout 3 bash -c 'exec 3<>"/dev/tcp/$0/$1" && head -c 4 <&3' "$1" "$2" 2>/dev/null)" || true
+  [ "$b" = "SSH-" ]
+}
+rewrite_port(){        # rewrite_port PUERTO TRANSPORTE TARGET FRAME POLL  (guarda y reescribe la unidad, sin reiniciar)
+  port_save "$@"; write_unit "$@"
+}
+restart_ports(){ local p; systemctl daemon-reload; for p in $(ports_list); do systemctl restart "$(svc "$p")" >/dev/null 2>&1 || true; done; }
+start_all(){ need_root; local p n=0; for p in $(ports_list); do start_port "$p"; n=$((n+1)); done
+  if [ "$n" -gt 0 ]; then sleep 1; ok "Iniciados $n puerto(s) HCR."; else info "No hay puertos HCR."; fi; }
+stop_all(){ need_root; local p n=0; for p in $(ports_list); do systemctl stop "$(svc "$p")" >/dev/null 2>&1 || true; n=$((n+1)); done
+  if [ "$n" -gt 0 ]; then warn "Detenidos $n puerto(s). Siguen con arranque automatico (opcion 3 para desactivar uno)."; else info "No hay puertos HCR."; fi; }
+
+# ---------------------------------------------------------------- perfil y destino SSH de todos los puertos
+pick_profile(){        # deja P_FRAME y P_POLL; devuelve 2 si se vuelve
+  echo; item 1 "TURBO  (frame $TURBO_FRAME, poll ${TURBO_POLL}s)"; item 2 "Rapido (frame 2000, poll 4s) *"
+  item 3 "Estable (frame 6000, poll 6s) *"; item 4 "Personalizar"; item 5 "ANTI-CORTES (frame 4000, poll 2s)"; item 0 "Volver"
+  info "* La app espera 4,5 s por cada consulta larga: con un poll de 4 s hay poco margen y con 6 s siempre hay timeouts. Si hay cortes, baja el FRAME y deja el poll en 2 s (ANTI-CORTES)."
+  local o; ask_op o
+  case "$o" in
+    1) P_FRAME=$TURBO_FRAME; P_POLL=$TURBO_POLL;;
+    2) P_FRAME=2000; P_POLL=4;;
+    3) P_FRAME=6000; P_POLL=6;;
+    5) P_FRAME=4000; P_POLL=2;;
+    4) ask P_FRAME "Max frame (1-$MAX_FRAME_LIMIT) [$TURBO_FRAME]: "; P_FRAME="${P_FRAME:-$TURBO_FRAME}"
+       valid_frame "$P_FRAME" || { fail "Frame invalido (1-$MAX_FRAME_LIMIT)."; return 1; }
+       ask P_POLL "Poll timeout en segundos, solo numero [$TURBO_POLL]: "; P_POLL="${P_POLL:-$TURBO_POLL}"
+       valid_poll "$P_POLL" || { fail "Poll invalido (numero mayor a 0)."; return 1; };;
+    0) return 2;; *) fail "Opcion invalida."; return 1;;
+  esac
+}
+set_profile_all(){
+  need_root; installed || { fail "Primero instala el binario (opcion 1)."; return 1; }
+  reconcile_ports; local ps p l t tg fr po rc=0; ps="$(ports_list)"
+  [ -n "$ps" ] || { info "No hay puertos HCR."; return 0; }
+  P_FRAME=""; P_POLL=""; pick_profile || rc=$?; [ "$rc" -eq 0 ] || return 0
+  for p in $ps; do l="$(port_line "$p")"; IFS='|' read -r _ t tg fr po <<< "$l"
+    rewrite_port "$p" "$t" "$tg" "$P_FRAME" "$P_POLL"; done
+  restart_ports
+  ok "Perfil aplicado a todos los puertos: frame $P_FRAME, poll ${P_POLL}s."
+  warn "Las conexiones abiertas se cortaron al reiniciar; la app reconecta sola."
+}
+set_target_all(){
+  need_root; installed || { fail "Primero instala el binario (opcion 1)."; return 1; }
+  reconcile_ports; local ps p l t tg fr po cur nt; ps="$(ports_list)"
+  [ -n "$ps" ] || { info "No hay puertos HCR."; return 0; }
+  cur="$(port_line "$(printf '%s\n' "$ps" | head -1)" | cut -d'|' -f3)"
+  ask nt "Nuevo destino SSH para TODOS los puertos (puerto o host:puerto) [${cur:-$DEFAULT_TARGET}]: "
+  nt="${nt:-${cur:-$DEFAULT_TARGET}}"
+  [[ "$nt" =~ ^[0-9]+$ ]] && nt="127.0.0.1:$nt"
+  valid_target "$nt" || { fail "Destino invalido. Usa un puerto (22) o host:puerto (127.0.0.1:22)."; return 1; }
+  if ! ssh_banner "${nt%:*}" "${nt##*:}"; then
+    warn "El destino $nt no contesto como SSH en este momento."
+    confirm_word SI "Aplicarlo igual." || { info "Sin cambios."; return 0; }
+  fi
+  for p in $ps; do l="$(port_line "$p")"; IFS='|' read -r _ t tg fr po <<< "$l"
+    rewrite_port "$p" "$t" "$nt" "$fr" "$po"; done
+  restart_ports
+  ok "Destino SSH de todos los puertos: $nt"
+}
+
+# ---------------------------------------------------------------- TLS (certificado propio + transporte de los puertos)
+TLS_CERT="$INSTALL_DIR/fullchain.pem"; TLS_KEY="$INSTALL_DIR/privkey.pem"
+ensure_openssl(){
+  have openssl && return 0
+  info "Instalando openssl..."
+  if have apt-get; then DEBIAN_FRONTEND=noninteractive apt-get install -y openssl >/dev/null 2>&1 || { apt-get update -y >/dev/null 2>&1; DEBIAN_FRONTEND=noninteractive apt-get install -y openssl >/dev/null 2>&1; }
+  elif have dnf; then dnf install -y openssl >/dev/null 2>&1
+  elif have yum; then yum install -y openssl >/dev/null 2>&1; fi
+  have openssl || { fail "Necesito openssl y no pude instalarlo."; return 1; }
+}
+tls_fingerprint(){ [ -f "$TLS_CERT" ] && have openssl || return 1; openssl x509 -in "$TLS_CERT" -noout -fingerprint -sha256 2>/dev/null | sed 's/.*=//'; }
+tls_ports_count(){ local p l t n=0; for p in $(ports_list); do l="$(port_line "$p")"; IFS='|' read -r _ t _ <<< "$l"; case "$t" in tls|auto) n=$((n+1));; esac; done; echo "$n"; }
+tls_make_cert(){       # tls_make_cert [CN]
+  ensure_openssl || return 1
+  local cn="${1:-$BRAND}"; mkdir -p "$INSTALL_DIR"
+  openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 3650 \
+    -subj "/CN=$cn" -keyout "$TLS_KEY" -out "$TLS_CERT" >/dev/null 2>&1 \
+    || { fail "No pude crear el certificado."; return 1; }
+  chmod 600 "$TLS_KEY"; chmod 644 "$TLS_CERT"
+  ok "Certificado creado (valido 10 anos, CN=$cn)."
+}
+tls_apply(){           # tls_apply TRANSPORTE  (a todos los puertos)
+  local nt="$1" ps p l t tg fr po; ps="$(ports_list)"
+  [ -n "$ps" ] || { info "No hay puertos HCR."; return 0; }
+  for p in $ps; do l="$(port_line "$p")"; IFS='|' read -r _ t tg fr po <<< "$l"
+    rewrite_port "$p" "$nt" "$tg" "$fr" "$po"; done
+  restart_ports
+  ok "Transport '$nt' aplicado a todos los puertos HCR."
+}
+tls_menu(){
+  need_root; installed || { fail "Primero instala el binario (opcion 1)."; return 1; }
+  reconcile_ports; calc_w; clear 2>/dev/null || true
+  title "TLS (HCR)"
+  line "Certificado:" "$([ -f "$TLS_CERT" ] && [ -f "$TLS_KEY" ] && echo creado || echo 'sin crear')"
+  line "Puertos con TLS:" "$(tls_ports_count) de $(ports_list | wc -l | tr -d ' ')"
+  local fp; fp="$(tls_fingerprint)"; [ -n "$fp" ] && line "Huella SHA-256:" "$fp"
+  dash
+  item 1 "ACTIVAR TLS en todos (modo auto)"
+  item 2 "SOLO TLS en todos (sin plano)"
+  item 3 "DESACTIVAR TLS (vuelve a plano)"
+  item 4 "CREAR CERTIFICADO NUEVO"
+  back
+  local o cn; ask_op o
+  case "$o" in
+    1) if [ ! -f "$TLS_CERT" ] || [ ! -f "$TLS_KEY" ]; then ask cn "Nombre (CN) del certificado [$BRAND]: "; tls_make_cert "${cn:-$BRAND}" || return 1; fi
+       tls_apply auto
+       info "Si la app no conecta, usa la opcion 3 para volver a plano."
+       [ -n "$(tls_fingerprint)" ] && info "Huella SHA-256: $(tls_fingerprint)";;
+    2) if [ ! -f "$TLS_CERT" ] || [ ! -f "$TLS_KEY" ]; then ask cn "Nombre (CN) del certificado [$BRAND]: "; tls_make_cert "${cn:-$BRAND}" || return 1; fi
+       confirm_word SI "Con 'solo TLS' las conexiones SIN TLS dejan de funcionar." || { info "Sin cambios."; return 0; }
+       tls_apply tls;;
+    3) tls_apply plain;;
+    4) confirm_word SI "El certificado nuevo cambia la huella SHA-256 del anterior." || { info "Sin cambios."; return 0; }
+       ask cn "Nombre (CN) del certificado [$BRAND]: "; tls_make_cert "${cn:-$BRAND}" || return 1
+       if [ "$(tls_ports_count)" -gt 0 ]; then restart_ports; ok "Puertos reiniciados con el certificado nuevo."; fi
+       info "Huella SHA-256: $(tls_fingerprint)";;
+    0|"") return 0;; *) fail "Opcion invalida.";;
+  esac
+}
+
+# ---------------------------------------------------------------- version anterior del binario
+rollback(){
+  need_root; installed || { fail "Primero instala el binario (opcion 1)."; return 1; }
+  [ -x "$BINARY_PATH.prev" ] || { fail "No hay version anterior guardada (se guarda sola al actualizar)."; return 1; }
+  "$BINARY_PATH.prev" -version 2>/dev/null | grep -q "hcr-server version" || { fail "La version anterior guardada no es valida."; return 1; }
+  info "Actual:   $("$BINARY_PATH" -version 2>/dev/null | head -1)"
+  info "Anterior: $("$BINARY_PATH.prev" -version 2>/dev/null | head -1)"
+  confirm_word SI "Se vuelve al binario anterior y se reinician los puertos." || { info "Sin cambios."; return 0; }
+  local keep="$BINARY_PATH.swap.$$"
+  cp -f "$BINARY_PATH" "$keep" 2>/dev/null || true
+  cp -f "$BINARY_PATH.prev" "$BINARY_PATH.new" && chmod 755 "$BINARY_PATH.new" && mv -f "$BINARY_PATH.new" "$BINARY_PATH" \
+    || { rm -f "$BINARY_PATH.new" "$keep"; fail "No pude restaurar la version anterior."; return 1; }
+  [ -f "$keep" ] && mv -f "$keep" "$BINARY_PATH.prev"       # la que estaba en uso queda como "anterior": se puede volver a ir y venir
+  restart_ports
+  ok "Binario anterior restaurado y puertos reiniciados."
+}
+
+# ---------------------------------------------------------------- autoprueba
+selftest(){
+  echo "===== AUTOPRUEBA HCR ====="
+  installed || { fail "Binario sin instalar (opcion 1)."; return 1; }
+  local bad=0 n=0 p l t tg fr po nr
+  if "$BINARY_PATH" -version 2>/dev/null | grep -q "hcr-server version"; then ok "Binario valido: $("$BINARY_PATH" -version 2>/dev/null | head -1)"
+  else fail "El binario no responde a -version."; bad=1; fi
+  [ -x "$BINARY_PATH.prev" ] && info "Hay una version anterior guardada (opcion 18 para volver)."
+  for p in $(ports_list); do
+    n=$((n+1)); l="$(port_line "$p")"; IFS='|' read -r _ t tg fr po <<< "$l"
+    if port_active "$p" && listening "$p"; then ok "Puerto $p: activo y escuchando (conexiones: $(conn_count "$p"))."
+    elif port_active "$p"; then fail "Puerto $p: el servicio esta activo pero nada escucha."; bad=1
+    else warn "Puerto $p: detenido."; fi
+    if ssh_banner "${tg%:*}" "${tg##*:}"; then ok "  destino $tg: responde SSH."
+    else fail "  destino $tg: no responde como SSH."; bad=1; fi
+    case "$t" in tls|auto)
+      if [ -f "$TLS_CERT" ] && [ -f "$TLS_KEY" ]; then ok "  transport $t: certificados presentes."
+      else fail "  transport $t: faltan certificados (menu TLS)."; bad=1; fi;; esac
+    nr="$(systemctl show "$(svc "$p")" -p NRestarts --value 2>/dev/null)" || nr=""
+    case "$nr" in ""|0) ;; *) warn "  el servicio se reinicio $nr vez/veces desde que arranco (ver logs).";; esac
+  done
+  [ "$n" -gt 0 ] || { warn "Sin puertos configurados (opcion 2)."; bad=1; }
+  if [ "$(tuning_state)" = on ]; then ok "Ajuste de red activo (TCP: $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo '?'))."
+  else warn "Ajuste de red apagado (opcion 8 o 7)."; fi
+  echo
+  if [ "$bad" -eq 0 ]; then ok "Todo en orden."; else fail "Hay problemas arriba."; fi
+  return "$bad"
+}
+
+# ---------------------------------------------------------------- limites y diagnostico (opciones propias de hcr-server)
+LIMITS_FILE="$INSTALL_DIR/limits.conf"
+lim_get(){ grep -m1 "^$1=" "$LIMITS_FILE" 2>/dev/null | cut -d= -f2-; }
+lim_set(){ mkdir -p "$INSTALL_DIR"; touch "$LIMITS_FILE"; chmod 600 "$LIMITS_FILE" 2>/dev/null || true
+  sed -i "/^$1=/d" "$LIMITS_FILE" 2>/dev/null || true
+  if [ -n "${2:-}" ]; then echo "$1=$2" >> "$LIMITS_FILE"; fi; return 0; }
+lim_show(){ local v; v="$(lim_get "$1")"; if [ -n "$v" ]; then echo "$v"; else echo "$2"; fi; }
+stats_show(){ local v; v="$(lim_get STATS)"; if [ -n "$v" ]; then echo "cada ${v}s"; else echo apagadas; fi; }
+limit_flags(){          # flags extra para el binario; vacio = valores propios del binario
+  local f="" v
+  v="$(lim_get MAX_SESSIONS)"; [ -n "$v" ] && f+=" --max-sessions $v"
+  v="$(lim_get MAX_PER_IP)";   [ -n "$v" ] && f+=" --max-sessions-per-ip $v"
+  v="$(lim_get MAX_CONNS)";    [ -n "$v" ] && f+=" --max-connections $v"
+  v="$(lim_get STATS)";        [ -n "$v" ] && f+=" --session-stats-interval ${v}s"
+  printf '%s' "$f"
+}
+valid_num(){ [[ "${2:-}" =~ ^[0-9]+$ ]] && [ "$2" -ge "$1" ] && [ "$2" -le "$3" ]; }   # valid_num min valor max
+rewrite_units(){ local p l t tg fr po; for p in $(ports_list); do l="$(port_line "$p")"; IFS='|' read -r _ t tg fr po <<< "$l"; write_unit "$p" "$t" "$tg" "$fr" "$po"; done; }
+lim_ask(){              # lim_ask CLAVE MIN MAX "texto" "valor-del-binario"
+  local k="$1" mn="$2" mx="$3" txt="$4" def="$5" cur v; cur="$(lim_get "$k")"
+  ask v "$txt [${cur:-$def}] (ENTER = dejar, D = valor del binario): "
+  case "$v" in
+    "") return 0;;
+    d|D) lim_set "$k" ""; return 0;;
+  esac
+  valid_num "$mn" "$v" "$mx" || { fail "Valor invalido ($mn-$mx)."; return 1; }
+  lim_set "$k" "$v"
+}
+hcr_mem_mb(){ awk '/MemTotal:/ {printf "%d", $2/1024}' /proc/meminfo 2>/dev/null || echo 1024; }
+hcr_max_sessions(){      # tope de sesiones segun la RAM del VPS (misma tabla que BHTTP)
+  local m; m="$(hcr_mem_mb)"; [[ "$m" =~ ^[0-9]+$ ]] || m=1024
+  if   [ "$m" -lt 768 ];  then echo 512
+  elif [ "$m" -lt 1536 ]; then echo 1024
+  elif [ "$m" -lt 3072 ]; then echo 2048
+  elif [ "$m" -lt 6144 ]; then echo 4096
+  else echo 8192; fi
+}
+limits_apply(){
+  rewrite_units; restart_ports
+  ok "Limites aplicados: sesiones $(lim_show MAX_SESSIONS '32 (defecto)') | por IP $(lim_show MAX_PER_IP 'auto') | conexiones $(lim_show MAX_CONNS '2048 (defecto)')."
+  warn "Las conexiones abiertas se cortaron al reiniciar; la app reconecta sola."
+}
+limits_menu(){
+  need_root; installed || { fail "Primero instala el binario (opcion 1)."; return 1; }
+  reconcile_ports; calc_w; clear 2>/dev/null || true
+  title "LIMITES HCR"
+  line "Sesiones:" "$(lim_show MAX_SESSIONS '32 (defecto)')"
+  line "Por IP:" "$(lim_show MAX_PER_IP 'auto (defecto)')"
+  line "Conexiones:" "$(lim_show MAX_CONNS '2048 (defecto)')"
+  line "RAM del VPS:" "$(hcr_mem_mb) MB"
+  dash
+  item 1 "MAXIMO (segun la RAM del VPS)"
+  item 2 "PERSONALIZAR"
+  item 3 "VALORES DEL BINARIO (32 / 16 / 2048)"
+  back
+  local o s c; ask_op o
+  case "$o" in
+    1) s="$(hcr_max_sessions)"; c=$((s * 64)); [ "$c" -gt 500000 ] && c=500000
+       info "Maximo para $(hcr_mem_mb) MB de RAM: $s sesiones, por IP igual al total, $c conexiones."
+       info "Subir los limites no da mas velocidad: solo quita topes cuando hay mucha gente."
+       confirm_word SI "Se quita el tope por IP: una sola IP podria ocupar todas las sesiones." || { info "Sin cambios."; return 0; }
+       lim_set MAX_SESSIONS "$s"; lim_set MAX_PER_IP "$s"; lim_set MAX_CONNS "$c"; limits_apply;;
+    2) info "Si hay mucha gente detras de la misma IP (datos moviles, Wi-Fi compartido), sube el limite por IP."
+       lim_ask MAX_SESSIONS 1 100000 "Max. sesiones totales" "32" || return 1
+       lim_ask MAX_PER_IP 0 100000 "Max. sesiones por IP (0 = automatico)" "auto" || return 1
+       lim_ask MAX_CONNS 1 1000000 "Max. conexiones totales" "2048" || return 1
+       limits_apply;;
+    3) lim_set MAX_SESSIONS ""; lim_set MAX_PER_IP ""; lim_set MAX_CONNS ""; limits_apply;;
+    0|"") return 0;; *) fail "Opcion invalida.";;
+  esac
+}
+diag_menu(){
+  need_root; installed || { fail "Primero instala el binario (opcion 1)."; return 1; }
+  reconcile_ports; calc_w; clear 2>/dev/null || true
+  local cur; cur="$(lim_get STATS)"
+  title "DIAGNOSTICO HCR"
+  line "Estadisticas:" "$([ -n "$cur" ] && echo "cada ${cur}s por sesion" || echo apagado)"
+  dash
+  item 1 "ACTIVAR (cada 10 s)"; item 2 "APAGAR"; item 3 "VER LOGS DE UN PUERTO"
+  back
+  local o; ask_op o
+  case "$o" in
+    1) lim_set STATS 10; rewrite_units; restart_ports
+       ok "Estadisticas por sesion activadas (cada 10 s)."
+       info "Reproduce el corte y mira los logs (opcion 3). Apagalas despues: los logs crecen."
+       warn "Las conexiones abiertas se cortaron al reiniciar; la app reconecta sola.";;
+    2) lim_set STATS ""; rewrite_units; restart_ports; ok "Estadisticas apagadas.";;
+    3) show_logs;;
+    0|"") return 0;; *) fail "Opcion invalida.";;
+  esac
+}
+
 # ---------------------------------------------------------------- menu
 menu(){
   need_root; local op st
@@ -2980,17 +3247,32 @@ menu(){
     if installed; then line "Binario:" "instalado"; else line "Binario:" "sin instalar (opcion 1)"; fi
     local p ps=""; for p in $(ports_list); do port_active "$p" && st=on || st=off; ps+="$p$( [ $st = on ] && echo '*') "; done
     line "Puertos:" "${ps:-ninguno}  (* = activo)"
+    line "Conexiones:" "$(total_conns) activas"
     line "Ajuste red:" "$(tuning_state) | $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo '?')"
     dash
     item 1 "INSTALAR / ACTUALIZAR HCR-SERVER"
+    item 10 "ESTADO"
+    item 11 "AUTOPRUEBA"
+    dash
     item 2 "AGREGAR PUERTO"
     item 3 "DETENER / REACTIVAR PUERTO"
     item 4 "EDITAR PUERTO"
     item 5 "ELIMINAR PUERTO"
     item 6 "VER LOGS DE UN PUERTO"
     dash
+    item 15 "CAMBIAR PERFIL (todos los puertos)"
+    item 16 "CAMBIAR DESTINO SSH (todos los puertos)"
+    item 17 "TLS (certificado y transporte)"
+    item 19 "LIMITES (sesiones / por IP / conexiones)"
+    item 20 "DIAGNOSTICO (estadisticas por sesion)"
+    dash
     item 7 "OPTIMIZAR VELOCIDAD (todos los puertos)" "$OR"
     tuning_state | grep -q on && st=on || st=off; printf ' %b[8]%b>%b %-30s ' "$GY" "$RD" "$WH" "AJUSTE DE RED (BBR/buffers)"; tag "$st"; printf '%b\n' "$C_OFF"
+    dash
+    item 12 "REINICIAR TODOS"
+    item 13 "INICIAR TODOS"
+    item 14 "DETENER TODOS"
+    item 18 "VOLVER A LA VERSION ANTERIOR" "$OR"
     item 9 "DESINSTALAR HCR" "$OR"
     back "Volver"
     ask_op op
@@ -2999,6 +3281,11 @@ menu(){
       5) del_port; pause;; 6) show_logs; pause;; 7) optimize; pause;;
       8) if [ -f "$BH_TUNE" ]; then tuning_off; else tuning_on; fi; pause;;
       9) do_uninstall; pause;;
+      10) status; pause;; 11) selftest || true; pause;;
+      12) restart_all; pause;; 13) start_all; pause;; 14) stop_all; pause;;
+      15) set_profile_all; pause;; 16) set_target_all; pause;; 17) tls_menu; pause;;
+      19) limits_menu; pause;; 20) diag_menu; pause;;
+      18) rollback; pause;;
       0) return 0;; *) echo " Opcion invalida"; sleep 1;;
     esac
   done
@@ -3006,11 +3293,19 @@ menu(){
 usage(){ cat <<EOF
 $CMD $MANAGER_VERSION - administrador HCR (modo velocidad)
   $CMD                    menu
-  $CMD install            descarga/actualiza el binario hcr-server
+  $CMD install            descarga/actualiza el binario hcr-server (guarda la version anterior)
   $CMD add-port PUERTO    crea un puerto con el perfil TURBO
   $CMD optimize           limites altos + ajuste de red en todos los puertos
   $CMD tuning-on | tuning-off   ajuste de red (BBR y buffers)
-  $CMD restart | status | logs PUERTO | uninstall
+  $CMD status | selftest  estado / autoprueba
+  $CMD restart | start | stop   reinicia / inicia / detiene todos los puertos
+  $CMD profile            cambia frame y poll de todos los puertos
+  $CMD target [DESTINO]   cambia el destino SSH de todos los puertos (puerto o host:puerto)
+  $CMD tls                menu de TLS
+  $CMD limits             limites de sesiones / por IP / conexiones
+  $CMD diag               estadisticas por sesion (diagnostico)
+  $CMD rollback           vuelve al binario anterior
+  $CMD logs PUERTO | uninstall
 EOF
 }
 main(){
@@ -3023,7 +3318,16 @@ main(){
     tuning-on) need_root; tuning_on;;
     tuning-off) need_root; tuning_off;;
     restart) need_root; restart_all;;
+    start) start_all;;
+    stop) stop_all;;
     status) status;;
+    selftest) selftest;;
+    profile) set_profile_all;;
+    target) set_target_all;;
+    tls) tls_menu;;
+    limits) limits_menu;;
+    diag) diag_menu;;
+    rollback) rollback;;
     logs) show_logs "${1:-}";;
     uninstall) do_uninstall;;
     help|-h|--help) usage;;
